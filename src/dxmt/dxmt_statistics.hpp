@@ -49,6 +49,7 @@ struct FrameStatistics {
   uint32_t compute_pass_count = 0;
   uint32_t blit_pass_count = 0;
   uint32_t event_stall = 0;
+  uint32_t query_yield = 0;
   uint32_t latency = 0;
   clock::duration encode_prepare_interval{};
   clock::duration encode_flush_interval{};
@@ -71,6 +72,7 @@ struct FrameStatistics {
     compute_pass_count = 0;
     blit_pass_count = 0;
     event_stall = 0;
+    query_yield = 0;
     latency = 0;
     encode_prepare_interval = {};
     encode_flush_interval = {};
@@ -136,6 +138,7 @@ public:
       max_.command_buffer_count = std::max(max_.command_buffer_count, frames_[i].command_buffer_count);
       max_.sync_count = std::max(max_.sync_count, frames_[i].sync_count);
       max_.event_stall = std::max(max_.event_stall, frames_[i].event_stall);
+      max_.query_yield = std::max(max_.query_yield, frames_[i].query_yield);
       max_.commit_interval = std::max(max_.commit_interval, frames_[i].commit_interval);
       max_.sync_interval = std::max(max_.sync_interval, frames_[i].sync_interval);
       max_.encode_prepare_interval = std::max(max_.encode_prepare_interval, frames_[i].encode_prepare_interval);

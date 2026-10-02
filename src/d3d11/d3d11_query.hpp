@@ -3,6 +3,7 @@
 #include "d3d11_device_child.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "log/log.hpp"
+#include "util_madeira_switch.hpp"
 #include "../d3d10/d3d10_query.hpp"
 
 DEFINE_COM_INTERFACE("a301e56d-d87e-4b69-8440-bd003e285904",
@@ -116,10 +117,18 @@ enum class EventState {
   Pending,
   Signaled,
   Stall,
+  StallYield,
   Invalid,
 };
 
 constexpr size_t kEventStallThreshold = 64;
+
+// The app opts in for iOS; other 64-bit frontends keep their current policy.
+// Cached once, like the queue wait backend. No sleep/clock/lock on short polls.
+inline bool queryPollYieldEnabled() {
+  static const bool enabled = madeiraSwitch("DXMT_QUERY_POLL_YIELD");
+  return enabled;
+}
 
 struct MTLD3D11EventQuery : public ID3D11Query {
   virtual void Issue(uint64_t current_seq_id) = 0;
@@ -138,6 +147,7 @@ public:
     state = QueryState::Issued;
     should_be_signaled_at = current_seq_id;
     stall_counter = 0;
+    stall_yield_counter = 0;
   }
 
   EventState CheckEventState(uint64_t coherent_seq_id) override {
@@ -146,6 +156,7 @@ public:
     if (should_be_signaled_at <= coherent_seq_id) {
       state = QueryState::Signaled;
       stall_counter = 0;
+      stall_yield_counter = 0;
       return EventState::Signaled;
     }
     if (stall_counter != ~0u) {
@@ -155,12 +166,21 @@ public:
       }
       stall_counter = ~0u;
     }
+    // Busy GetData loops can issue hundreds of thousands of calls before
+    // the real shared-event watermark advances. Let the encoder/retirement
+    // workers run once per 64 long polls; never fabricate query completion.
+    if (queryPollYieldEnabled() && ++stall_yield_counter == kEventStallThreshold) {
+      stall_yield_counter = 0;
+      SwitchToThread();
+      return EventState::StallYield;
+    }
     return EventState::Stall;
   };
 
 private:
   QueryState state = QueryState::Undefined;
   uint32_t stall_counter = 0;
+  uint32_t stall_yield_counter = 0;
   uint64_t should_be_signaled_at = 0;
 };
 

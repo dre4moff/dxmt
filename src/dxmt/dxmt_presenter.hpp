@@ -35,6 +35,10 @@ public:
 
   bool changeLayerColorSpace(WMTColorSpace colorspace);
 
+  void changeScaleFactor(float previous, float next) {
+    if (previous > 0) layer_props_.contents_scale *= next / previous;
+  }
+
   void changeHDRMetadata(const WMTHDRMetadata *metadata);
 
   void changeGammaRamp(const DXMTGammaRamp *gamma_ramp);

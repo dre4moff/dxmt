@@ -1,5 +1,11 @@
 #include <stdatomic.h>
-#include "../../../../../build/madeira_cfg.h"   /* ml1095: one config file */
+extern int madeira_perf_enabled(void);
+extern void madeira_perf_commit(void);
+extern void madeira_perf_gpu(double from, double to, int failed);
+extern void madeira_perf_wait(double seconds);
+extern void madeira_perf_encode(double seconds, uint64_t commands, uint64_t declarations,
+                                uint64_t calls, int compute);
+#include "../../../../build/madeira_cfg.h"   /* ml1095: one config file */
 #include <sys/mman.h>
 #include <mach/vm_statistics.h>
 #include <errno.h>
@@ -45,6 +51,9 @@ extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name,
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
+#include "wmt_resource_batch.h"
+_Static_assert(sizeof(obj_handle_t) == sizeof(id), "Metal resource handles must match native pointers");
+#include "../../../../build/ntdll-unix/runtime_profiling.h"
 
 /* iOS-Madeira 2026-05-22 draw-call telemetry. Defined further down with
  * the present counter; forward-declared here so the draw command cases
@@ -253,7 +262,7 @@ _NSObject_release(NSObject **obj) {
   /* ml820: a guest-local autorelease pool going away is the moment the host
    * objects it mirrored (command buffers, encoders) are released too. */
   if (wmtr_enabled() && [*obj isKindOfClass:[NSAutoreleasePool class]]) wmtr_pool_drain();
-  if (*obj && [*obj retainCount] == 1) {   /* ml1155: this release frees it */
+  if ((madeira_runtime_profiling_cached() || wmt_stale_probe_on()) && *obj && [*obj retainCount] == 1) {   /* ml1155: this release frees it */
     uint64_t k = __atomic_fetch_add(&g_wmt_rel_n, 1, __ATOMIC_RELAXED) & 16383;
     g_wmt_rel[k].p = (uintptr_t)*obj; g_wmt_rel[k].cls = object_getClassName(*obj);
     if (wmt_stale_probe_on() && strstr(g_wmt_rel[k].cls, "Buffer")) wmt_freed_set((uintptr_t)*obj, 1);   /* ml1156 */
@@ -501,6 +510,12 @@ _MTLCommandBuffer_commit(void *obj) {
       ios_frame_gpu(buffer.GPUStartTime > 0.0 && span > 0.0 ? (unsigned long long)(span * 1e9) : 0, depth);
     }];
   }
+  if (madeira_perf_enabled()) {
+    madeira_perf_commit();
+    [(id<MTLCommandBuffer>)params->handle addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+      madeira_perf_gpu(buffer.GPUStartTime, buffer.GPUEndTime, buffer.status == MTLCommandBufferStatusError);
+    }];
+  }
   [(id<MTLCommandBuffer>)params->handle commit];
   return STATUS_SUCCESS;
 }
@@ -514,7 +529,10 @@ _MTLCommandBuffer_waitUntilCompleted(void *obj) {
     wmtr_rb_drain(params->handle);   /* ml820: GPU results back before the guest reads them */
     return STATUS_SUCCESS;
   }
+  int sample = madeira_perf_enabled();
+  double before = sample ? CACurrentMediaTime() : 0;
   [(id<MTLCommandBuffer>)params->handle waitUntilCompleted];
+  if (sample) madeira_perf_wait(CACurrentMediaTime() - before);
   return STATUS_SUCCESS;
 }
 
@@ -1715,7 +1733,7 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
  * machine, with nothing pointing at the cause.
  */
 #include "wmt_remote_pack.h"
-#include "../../../../remote-metal/host/wmt_decode.h"
+#include "../../../../research/remote-metal/host/wmt_decode.h"
 
 static int wmt_shadow_on = -1;
 static unsigned long wmt_sh_ok, wmt_sh_packfail, wmt_sh_valfail, wmt_sh_records;
@@ -2087,6 +2105,25 @@ static uint32_t wmt_compute_cmd_size(unsigned type, const struct wmtcmd_base *c,
   }
 }
 
+/* Bounded native command-batch timing. No per-command clock, locks or allocation.
+ * Explicit opt-out retains one Metal declaration per command. */
+static int wmt_resource_batch_enabled(void) {
+  static _Atomic int enabled = -1;
+  int value = atomic_load_explicit(&enabled, memory_order_relaxed);
+  if (value < 0) {
+    const char *setting = getenv("DXMT_RESOURCE_BATCH");
+    value = !setting || !*setting || strcmp(setting, "0");
+    atomic_store_explicit(&enabled, value, memory_order_relaxed);
+  }
+  return value;
+}
+static double wmt_batch_seconds(uint64_t start) {
+  static mach_timebase_info_data_t timebase;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{ mach_timebase_info(&timebase); });
+  return (double)(mach_absolute_time() - start) * timebase.numer / timebase.denom * 1e-9;
+}
+
 static NTSTATUS
 _MTLComputeCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
@@ -2125,10 +2162,15 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     return STATUS_SUCCESS;
   }
   const struct wmtcmd_base *next = params->cmd_head.ptr;
+  const int sample = madeira_perf_enabled();
+  const uint64_t sample_start = sample ? mach_absolute_time() : 0;
+  uint64_t command_count = 0, declarations = 0, declaration_calls = 0;
+  const int resource_batch = wmt_resource_batch_enabled();
   wmt_census_batch(next, 1);
   id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)params->encoder;
   MTLSize threadgroup_size = {0, 0, 0};
   while (next) {
+    ++command_count;
     switch ((enum WMTComputeCommandType)next->type) {
     default:
       assert(!next->type && "unhandled compute command type");
@@ -2172,10 +2214,25 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       break;
     }
     case WMTComputeCommandUseResource: {
-      struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
-      wmt_stale_check(body->resource, "compute useResource");
-      [encoder useResource:(id<MTLResource>)body->resource usage:(MTLResourceUsage)body->usage];
-      break;
+      struct wmt_resource_batch batch;
+      if (resource_batch) batch = wmt_collect_resources(next, 1);
+      else {
+        const struct wmtcmd_compute_useresource *body = (const void *)next;
+        batch = (struct wmt_resource_batch){.resources = {body->resource},
+            .next = next->next.ptr, .count = 1, .usage = body->usage,
+            .stages = 0};
+      }
+      for (unsigned i = 0; i < batch.count; ++i)
+        wmt_stale_check(batch.resources[i], "compute useResource");
+      if (batch.count == 1)
+        [encoder useResource:(id<MTLResource>)batch.resources[0] usage:(MTLResourceUsage)batch.usage];
+      else
+        [encoder useResources:(const id<MTLResource> *)batch.resources count:batch.count
+                         usage:(MTLResourceUsage)batch.usage];
+      declarations += batch.count; ++declaration_calls;
+      command_count += batch.count - 1;
+      next = batch.next;
+      continue;
     }
     case WMTComputeCommandSetBytes: {
       struct wmtcmd_compute_setbytes *body = (struct wmtcmd_compute_setbytes *)next;
@@ -2202,6 +2259,8 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
 
     next = next->next.ptr;
   }
+  if (sample) madeira_perf_encode(wmt_batch_seconds(sample_start), command_count,
+                                  declarations, declaration_calls, 1);
   return STATUS_SUCCESS;
 }
 
@@ -2283,9 +2342,14 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
    * forever. Ordering it this way makes "packed == batches" an exact equality
    * that either holds or reveals a real skip. */
   wmt_shadow_batch(next);
+  const int sample = madeira_perf_enabled();
+  const uint64_t sample_start = sample ? mach_absolute_time() : 0;
+  uint64_t command_count = 0, declarations = 0, declaration_calls = 0;
+  const int resource_batch = wmt_resource_batch_enabled();
   wmt_census_batch(next, 0);
   id<MTLRenderCommandEncoder> encoder = (id<MTLRenderCommandEncoder>)params->encoder;
   while (next) {
+    ++command_count;
     switch ((enum WMTRenderCommandType)next->type) {
     default:
       assert(!next->type && "unhandled render command type");
@@ -2293,12 +2357,27 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandNop:
       break;
     case WMTRenderCommandUseResource: {
-      struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
-      wmt_stale_check(body->resource, "render useResource");
-      [encoder useResource:(id<MTLResource>)body->resource
-                     usage:(MTLResourceUsage)body->usage
-                    stages:(MTLRenderStages)body->stages];
-      break;
+      struct wmt_resource_batch batch;
+      if (resource_batch) batch = wmt_collect_resources(next, 0);
+      else {
+        const struct wmtcmd_render_useresource *body = (const void *)next;
+        batch = (struct wmt_resource_batch){.resources = {body->resource},
+            .next = next->next.ptr, .count = 1, .usage = body->usage,
+            .stages = body->stages};
+      }
+      for (unsigned i = 0; i < batch.count; ++i)
+        wmt_stale_check(batch.resources[i], "render useResource");
+      if (batch.count == 1)
+        [encoder useResource:(id<MTLResource>)batch.resources[0] usage:(MTLResourceUsage)batch.usage
+                    stages:(MTLRenderStages)batch.stages];
+      else
+        [encoder useResources:(const id<MTLResource> *)batch.resources count:batch.count
+                         usage:(MTLResourceUsage)batch.usage
+                    stages:(MTLRenderStages)batch.stages];
+      declarations += batch.count; ++declaration_calls;
+      command_count += batch.count - 1;
+      next = batch.next;
+      continue;
     }
     case WMTRenderCommandSetVertexBuffer: {
       struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
@@ -2628,6 +2707,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     next = next->next.ptr;
   }
+  if (sample) madeira_perf_encode(wmt_batch_seconds(sample_start), command_count,
+                                  declarations, declaration_calls, 0);
   return STATUS_SUCCESS;
 }
 
@@ -3106,6 +3187,10 @@ static const int SIGNALS[] = {
 static NTSTATUS
 _MTLDevice_newTemporalScaler(void *obj) {
   struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
+  if (![MTLFXTemporalScalerDescriptor supportsDevice:(id<MTLDevice>)params->device]) {
+    params->ret = 0;
+    return STATUS_SUCCESS;
+  }
   MTLFXTemporalScalerDescriptor *desc = [[MTLFXTemporalScalerDescriptor alloc] init];
   const struct WMTFXTemporalScalerInfo *info = params->info.ptr;
   desc.colorTextureFormat = to_metal_pixel_format(info->color_format);
@@ -3119,13 +3204,23 @@ _MTLDevice_newTemporalScaler(void *obj) {
   desc.inputContentMaxScale = info->input_content_max_scale;
   desc.inputContentMinScale = info->input_content_min_scale;
   desc.inputContentPropertiesEnabled = info->input_content_properties_enabled;
-  #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+#if TARGET_OS_IOS
+  // Mobile GPUs may support a narrower range than the desktop default 1..3.
+  if (@available(iOS 17.0, *)) {
+    float minimum = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:(id<MTLDevice>)params->device];
+    float maximum = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:(id<MTLDevice>)params->device];
+    if (desc.inputContentMinScale < minimum) desc.inputContentMinScale = minimum;
+    if (desc.inputContentMaxScale > maximum) desc.inputContentMaxScale = maximum;
+  }
+  desc.requiresSynchronousInitialization = info->requires_synchronous_initialization;
+#elif __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
     desc.requiresSynchronousInitialization = info->requires_synchronous_initialization;
   }
-  #endif
+#endif
   desc.autoExposureEnabled = info->auto_exposure;
 
+#if !TARGET_OS_IOS
   struct sigaction old_action[sizeof(SIGNALS) / sizeof(int)], new_action;
   if (@available(macOS 16, *)) {} else {
     new_action.sa_handler = temp_handler;
@@ -3134,13 +3229,16 @@ _MTLDevice_newTemporalScaler(void *obj) {
     for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
       sigaction(SIGNALS[i], &new_action, &old_action[i]);
   }
+#endif
 
   params->ret = (obj_handle_t)[desc newTemporalScalerWithDevice:(id<MTLDevice>)params->device];
 
+#if !TARGET_OS_IOS
   if (@available(macOS 16, *)) {} else {
     for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
       sigaction(SIGNALS[i], &old_action[i], NULL);
   }
+#endif
 
   [desc release];
   return STATUS_SUCCESS;
@@ -3183,6 +3281,12 @@ _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   scaler.jitterOffsetX = props->jitter_offset_x;
   scaler.jitterOffsetY = props->jitter_offset_y;
   scaler.preExposure = props->pre_exposure;
+  // Keep the scaler and this evaluation's resources alive even if the game
+  // resets its list or releases its NGX feature immediately after submission.
+  NSArray *retained = @[scaler, scaler.colorTexture, scaler.outputTexture,
+                        scaler.depthTexture, scaler.motionTexture,
+                        scaler.exposureTexture ?: (id)[NSNull null]];
+  [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> buffer) { (void)[retained count]; }];
   [scaler encodeToCommandBuffer:cmdbuf];
   return STATUS_SUCCESS;
 }
@@ -3334,6 +3438,23 @@ _MetalLayer_nextDrawable(void *obj) {
     dprintf(STDERR_FILENO, "[iOS DXMT] nextDrawable #%llu took %.2fms\n", (unsigned long long)n, ms);
   }
   return STATUS_SUCCESS;
+}
+
+int madeira_supports_spatial_upscaling(void) {
+  // The remote backend cannot run local MetalFX against tagged handles.
+  if (wmtr_enabled()) return 0;
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  int supported = device && [MTLFXSpatialScalerDescriptor supportsDevice:device];
+  [device release];
+  return supported;
+}
+
+int madeira_supports_temporal_upscaling(void) {
+  if (wmtr_enabled()) return 0;
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  int supported = device && [MTLFXTemporalScalerDescriptor supportsDevice:device];
+  [device release];
+  return supported;
 }
 
 static NTSTATUS
@@ -5043,11 +5164,40 @@ _MTLDevice_newSharedTexture(void *obj) {
 }
 
 /* Private API to register a mach port with the bootstrap server */
+#if TARGET_OS_IOS
+#include "../../../../build/dxmt-ios/shared_port_registry.h"
+static struct madeira_shared_port_registry madeira_shared_ports = MADEIRA_SHARED_PORT_REGISTRY_INIT;
+static pthread_once_t madeira_shared_ports_once = PTHREAD_ONCE_INIT;
+
+static int madeira_shared_port_retain(uint32_t port) {
+  return mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS;
+}
+
+static void madeira_shared_port_release(uint32_t port) {
+  mach_port_deallocate(mach_task_self(), port);
+}
+
+static void madeira_shared_ports_exit(void) {
+  madeira_shared_port_clear(&madeira_shared_ports, madeira_shared_port_release);
+}
+
+static void madeira_shared_ports_init(void) {
+  atexit(madeira_shared_ports_exit);
+}
+#else
 extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
+#endif
 
 static NTSTATUS
 _WMTBootstrapRegister(void *obj) {
   struct unixcall_bootstrap *params = obj;
+#if TARGET_OS_IOS
+  pthread_once(&madeira_shared_ports_once, madeira_shared_ports_init);
+  int ok = madeira_shared_port_register(&madeira_shared_ports, params->name, params->mach_port,
+                                       madeira_shared_port_retain);
+  fprintf(stderr, "[wmt-shared-port] register local=%d port=%u\n", ok, params->mach_port);
+  return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+#else
   mach_port_t rp = params->mach_port;
   mach_port_t bp;
 
@@ -5056,11 +5206,18 @@ _WMTBootstrapRegister(void *obj) {
   NTSTATUS ret = bootstrap_register2(bp, params->name, rp, 0) != KERN_SUCCESS ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
   mach_port_deallocate(mach_task_self(), bp);
   return ret;
+#endif
 }
 
 static NTSTATUS
 _WMTBootstrapLookUp(void *obj) {
   struct unixcall_bootstrap *params = obj;
+#if TARGET_OS_IOS
+  int ok = madeira_shared_port_lookup(&madeira_shared_ports, params->name, &params->mach_port,
+                                     madeira_shared_port_retain);
+  fprintf(stderr, "[wmt-shared-port] lookup local=%d port=%u\n", ok, params->mach_port);
+  return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+#else
   mach_port_t rp = 0;
   mach_port_t bp;
 
@@ -5070,6 +5227,7 @@ _WMTBootstrapLookUp(void *obj) {
   mach_port_deallocate(mach_task_self(), bp);
   params->mach_port = rp;
   return ret;
+#endif
 }
 
 @protocol MTLDeviceSPI <MTLDevice>

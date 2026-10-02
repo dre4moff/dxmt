@@ -403,6 +403,9 @@ public:
       switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
       case EventState::Pending:
         break;
+      case EventState::StallYield:
+        cmd_queue.CurrentFrameStatistics().query_yield++;
+        [[fallthrough]];
       case EventState::Stall:
         GetDataFlags &= ~D3D11_ASYNC_GETDATA_DONOTFLUSH;
         break;

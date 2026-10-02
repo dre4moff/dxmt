@@ -39,6 +39,11 @@ DEFINE_COM_INTERFACE("19a8e35a-38be-418f-94e3-9f7323936870", IMTLD3D11ContextExt
   ) = 0;
 };
 
+// Separate IID preserves the published Ext/Ext1 vtables.
+DEFINE_COM_INTERFACE("bca40e60-0914-47aa-99f8-2e93a3a88de1", IMTLD3D11ContextExt2) : public IMTLD3D11ContextExt1 {
+  virtual HRESULT STDMETHODCALLTYPE TryTemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D11_DESC *pDesc) = 0;
+};
+
 DEFINE_COM_INTERFACE("efc77ae6-2179-4c0a-b844-7661ca0dcde7", IMTLD3D11DeviceExt)
     : public IUnknown {
   virtual void STDMETHODCALLTYPE SetShaderExtensionSlot(UINT Slot) = 0;

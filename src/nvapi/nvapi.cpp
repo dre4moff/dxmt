@@ -23,7 +23,7 @@ NvAPI_Initialize() {
   if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {
     return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
   }
-  s_initialization_count++;
+  if (s_initialization_count++ == 0) Logger::info("[dlss-metalfx] NVAPI initialized");
   return NVAPI_OK;
 };
 

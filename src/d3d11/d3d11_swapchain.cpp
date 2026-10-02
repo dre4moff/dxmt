@@ -15,6 +15,7 @@
 #include "d3d11_device.hpp"
 #include "util_cpu_fence.hpp"
 #include "util_env.hpp"
+#include "util_metalfx_profile.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 #include "wsi_monitor.hpp"
@@ -139,7 +140,11 @@ public:
     }
 
     if constexpr (EnableMetalFX) {
-      scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
+      // Per-game launch choice has precedence without rewriting unrelated DXMT_CONFIG sections.
+      const auto selected = env::getEnvVar("DXMT_METALFX_SPATIAL_FACTOR");
+      scale_factor = selected == "1.5" ? 1.5f : selected == "2" ? 2.0f :
+          std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
+      requested_scale_factor = scale_factor;
     }
 
     presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
@@ -495,6 +500,15 @@ public:
       backbuffer_desc_.Height = desc_.Height;
     }
 
+    if constexpr (EnableMetalFX) {
+      const auto dimensions = metalFXOutput(desc_.Width, desc_.Height, requested_scale_factor,
+          metalFXOutputLimit(env::getEnvVar("DXMT_METALFX_OUTPUT_WIDTH")),
+          metalFXOutputLimit(env::getEnvVar("DXMT_METALFX_OUTPUT_HEIGHT")));
+      presenter->changeScaleFactor(scale_factor, dimensions.factor);
+      scale_factor = dimensions.factor;
+      output_width = dimensions.width;
+      output_height = dimensions.height;
+    }
     ApplyLayerProps();
 
     backbuffer_desc_.Format = desc_.Format;
@@ -509,24 +523,38 @@ public:
     backbuffer_->Release();
 
     if constexpr (EnableMetalFX) {
-      D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc_;
-      upscaled_desc_.Height *= scale_factor;
-      upscaled_desc_.Width *= scale_factor;
       upscaled_backbuffer_ = nullptr;
+      metalfx_scaler = nullptr;
+      if (scale_factor <= 1) {
+        Logger::info(str::format("[metalfx] bypass: input=", desc_.Width, "x", desc_.Height,
+                                " already reaches selected output; no extra scaling"));
+        return S_OK;
+      }
+      D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc_;
+      upscaled_desc_.Height = output_height;
+      upscaled_desc_.Width = output_width;
       if (FAILED(dxmt::CreateDeviceTexture2D(
               device_, &upscaled_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&upscaled_backbuffer_)
-          )))
-        return E_FAIL;
+          ))) {
+        WARN("[metalfx] output allocation failed; using ordinary presentation");
+        return S_OK;
+      }
 
       WMTFXSpatialScalerInfo info;
       info.input_height = desc_.Height;
       info.input_width = desc_.Width;
-      info.output_height = desc_.Height * scale_factor;
-      info.output_width = desc_.Width * scale_factor;
+      info.output_height = output_height;
+      info.output_width = output_width;
       info.color_format = backbuffer_->texture()->pixelFormat();
       info.output_format =upscaled_backbuffer_->texture()->pixelFormat();
       metalfx_scaler = device_->GetMTLDevice().newSpatialScaler(info);
-      D3D11_ASSERT(metalfx_scaler && "otherwise metalfx failed to initialize");
+      if (!metalfx_scaler) {
+        upscaled_backbuffer_ = nullptr;
+        WARN("[metalfx] scaler creation failed; using ordinary presentation");
+      } else {
+        Logger::info(str::format("[metalfx] active input=", info.input_width, "x", info.input_height,
+                                " output=", info.output_width, "x", info.output_height));
+      }
     }
 
     return S_OK;
@@ -578,8 +606,9 @@ public:
                               : colorspace_,
                           LayerSupportEDR());
     if (presenter->changeLayerProperties(
-            ConvertSwapChainFormat(desc_.Format), target_color_space, desc_.Width * scale_factor,
-            desc_.Height * scale_factor, desc_.SampleDesc.Count
+            ConvertSwapChainFormat(desc_.Format), target_color_space,
+            EnableMetalFX ? output_width : desc_.Width,
+            EnableMetalFX ? output_height : desc_.Height, desc_.SampleDesc.Count
         ))
       device_context_->WaitUntilGPUIdle();
   };
@@ -809,25 +838,30 @@ public:
       auto output = static_cast<MTLDXGIOutput *>(target_.ptr());
       presenter->changeGammaRamp(output->GetGammaRamp());
     }
+    bool upscaled_present = false;
     if constexpr (EnableMetalFX) {
-      chunk->emitcc([
-        this, vsync_duration, backbuffer = backbuffer_->texture(),
-        sync_state = SyncFrame(++presentation_count_),
-        upscaled = upscaled_backbuffer_->texture(),
-        scaler = this->metalfx_scaler, state = presenter->synchronizeLayerProperties()
-      ](ArgumentEncodingContext &ctx) mutable {
-        auto &scaler_info = ctx.currentFrameStatistics().last_scaler_info;
-        scaler_info.type = ScalerType::Spatial;
-        scaler_info.input_width = backbuffer->width();
-        scaler_info.input_height = backbuffer->height();
-        scaler_info.output_width = upscaled->width();
-        scaler_info.output_height = upscaled->height();
-        ctx.upscale(backbuffer, upscaled, scaler);
-        ctx.present(upscaled, presenter, vsync_duration, state.metadata);
-        ReleaseSemaphore(present_semaphore_, 1, nullptr);
-        this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
-      });
-    } else {
+      if (metalfx_scaler && upscaled_backbuffer_) {
+        upscaled_present = true;
+        chunk->emitcc([
+          this, vsync_duration, backbuffer = backbuffer_->texture(),
+          sync_state = SyncFrame(++presentation_count_),
+          upscaled = upscaled_backbuffer_->texture(),
+          scaler = this->metalfx_scaler, state = presenter->synchronizeLayerProperties()
+        ](ArgumentEncodingContext &ctx) mutable {
+          auto &scaler_info = ctx.currentFrameStatistics().last_scaler_info;
+          scaler_info.type = ScalerType::Spatial;
+          scaler_info.input_width = backbuffer->width();
+          scaler_info.input_height = backbuffer->height();
+          scaler_info.output_width = upscaled->width();
+          scaler_info.output_height = upscaled->height();
+          ctx.upscale(backbuffer, upscaled, scaler);
+          ctx.present(upscaled, presenter, vsync_duration, state.metadata);
+          ReleaseSemaphore(present_semaphore_, 1, nullptr);
+          this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+        });
+      }
+    }
+    if (!upscaled_present) {
       chunk->emitcc([
         this, vsync_duration, state = presenter->synchronizeLayerProperties(),
         sync_state = SyncFrame(++presentation_count_),
@@ -922,13 +956,14 @@ public:
       if ((++madeira_stats_frame % 64) == 0) {
         Logger::info(std::format(
             "[FRAME_STATS] #{} cmdbufs={} commit_avg={:.2f}ms sync_cnt={} sync_avg={:.2f}ms "
-            "event_stall_max={} latency_avg={:.2f}ms enc_prep={:.2f}ms enc_flush={:.2f}ms "
+            "event_stall_max={} query_yield_max={} latency_avg={:.2f}ms enc_prep={:.2f}ms enc_flush={:.2f}ms "
             "drawable_block={:.2f}ms renderpass={}+{} clear={}+{}",
             madeira_stats_frame, frame.command_buffer_count,
             average.commit_interval.count() / 1000000.0,
             frame.sync_count,
             average.sync_interval.count() / 1000000.0,
             statistics.max().event_stall,
+            statistics.max().query_yield,
             average.present_lantency_interval.count() / 1000000.0,
             average.encode_prepare_interval.count() / 1000000.0,
             average.encode_flush_interval.count() / 1000000.0,
@@ -1131,6 +1166,8 @@ private:
   std::conditional<EnableMetalFX, WMT::Reference<WMT::FXSpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;
   float scale_factor = 1.0;
+  float requested_scale_factor = 1.0;
+  uint32_t output_width = 0, output_height = 0;
 };
 
 HRESULT

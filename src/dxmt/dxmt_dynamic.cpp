@@ -8,10 +8,14 @@ DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) 
     flags_(flags),
     name_(buffer->current()) {
   /* ml681 */
-  g_live_dynbuf.created.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
-  census_id_ = g_dyn_next_id.fetch_add(1, std::memory_order_relaxed);
-  if (census_id_ < DYN_CENSUS_SLOTS)
-    g_dyn_stats[census_id_].length.store(buffer ? buffer->length() : 0, std::memory_order_relaxed);
+  if (madeiraTextureDiagnosticsEnabled()) {
+    g_live_dynbuf.created.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
+    census_id_ = g_dyn_next_id.fetch_add(1, std::memory_order_relaxed);
+    if (census_id_ < DYN_CENSUS_SLOTS)
+      g_dyn_stats[census_id_].length.store(buffer ? buffer->length() : 0, std::memory_order_relaxed);
+  } else {
+    census_id_ = DYN_CENSUS_SLOTS;
+  }
 }
 
 void
@@ -22,7 +26,7 @@ DynamicBuffer::incRef() {
 void
 DynamicBuffer::decRef() {
   if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u) {
-    g_live_dynbuf.destroyed.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
+    if (madeiraTextureDiagnosticsEnabled()) g_live_dynbuf.destroyed.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
     delete this;
   }
 };
@@ -40,7 +44,7 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
     if (fifo.empty()) {
       break;
     }
-    auto entry = fifo.front();
+    auto &entry = fifo.front();
     if (entry.will_free_at > coherent_seq_id) {
       break;
     }
@@ -59,22 +63,24 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
    * 8192 for observability silently switched the trim on for the instances that
    * held ~1GB, which is the entire reason memory dropped.
    *
-   * The walk and the trim now run for EVERY instance; only the statistics are
-   * gated. Behaviour must never depend on diagnostic capacity. */
+   * The trim runs for EVERY instance; the complete diagnostic walk is
+   * optional. The normal path examines only the retired prefix when needed. Behaviour must never depend on diagnostic capacity. */
   {
-    const bool stats = census_id_ < DYN_CENSUS_SLOTS;
+    const bool stats = madeiraTextureDiagnosticsEnabled() && census_id_ < DYN_CENSUS_SLOTS;
     uint64_t en = 0, eb = 0, in_n = 0, in_b = 0, lo = ~0ull, hi = 0, dup = 0;
     const void *prev_seen[8] = {nullptr};
     unsigned pi = 0;
-    for (const auto &e : fifo) {
-      uint64_t bytes = e.allocation.ptr() ? e.allocation->census_bytes_ : 0;
-      if (e.will_free_at <= coherent_seq_id) { en++; eb += bytes; }
-      else                                   { in_n++; in_b += bytes; }
-      if (e.will_free_at < lo) lo = e.will_free_at;
-      if (e.will_free_at > hi) hi = e.will_free_at;
-      for (unsigned k = 0; k < 8; k++)
-        if (prev_seen[k] && prev_seen[k] == (const void *)e.allocation.ptr()) { dup++; break; }
-      prev_seen[pi++ & 7] = (const void *)e.allocation.ptr();
+    if (stats) {
+      for (const auto &e : fifo) {
+        uint64_t bytes = e.allocation.ptr() ? e.allocation->census_bytes_ : 0;
+        if (e.will_free_at <= coherent_seq_id) { en++; eb += bytes; }
+        else                                   { in_n++; in_b += bytes; }
+        if (e.will_free_at < lo) lo = e.will_free_at;
+        if (e.will_free_at > hi) hi = e.will_free_at;
+        for (unsigned k = 0; k < 8; k++)
+          if (prev_seen[k] && prev_seen[k] == (const void *)e.allocation.ptr()) { dup++; break; }
+        prev_seen[pi++ & 7] = (const void *)e.allocation.ptr();
+      }
     }
     if (stats) {
       DynStat &st = g_dyn_stats[census_id_];
@@ -97,6 +103,14 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
      * A blanket depth cap would be a use-after-free: an entry whose
      * will_free_at still exceeds coherent_seq_id can be in GPU use right now. */
     enum { DYN_KEEP_ELIGIBLE = 64 };
+    if (!stats && fifo.size() > DYN_KEEP_ELIGIBLE) {
+      // Only the retired prefix can be trimmed. Avoid scanning in-flight tails
+      // or small reserves; diagnostics above are not needed for this decision.
+      for (const auto &e : fifo) {
+        if (e.will_free_at > coherent_seq_id) break;
+        ++en;
+      }
+    }
     if (en > DYN_KEEP_ELIGIBLE) {
       uint64_t drop = en - DYN_KEEP_ELIGIBLE, freed = 0, freed_n = 0;
       while (drop && !fifo.empty()) {
@@ -109,50 +123,56 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
       }
       if (freed_n) {
         trimmed_last_ = true;                  /* ml685: for trim-regret */
-        g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
-        g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
-        if (stats) {
-          DynStat &st = g_dyn_stats[census_id_];
-          st.trimmed_n.fetch_add(freed_n, std::memory_order_relaxed);
-          st.trimmed_bytes.fetch_add(freed, std::memory_order_relaxed);
+        if (madeiraTextureDiagnosticsEnabled()) {
+          g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
+          g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
+          if (stats) {
+            DynStat &st = g_dyn_stats[census_id_];
+            st.trimmed_n.fetch_add(freed_n, std::memory_order_relaxed);
+            st.trimmed_bytes.fetch_add(freed, std::memory_order_relaxed);
+          }
         }
       }
     }
   }
 
-  /* ml684: report on SEQUENCE ADVANCEMENT, not only on memory high-water marks.
-   * Every prior census fired on a rising HWM, so once the footprint plateaued
-   * near jetsam the reports stopped -- exactly when the retained set was most
-   * interesting. Sampling on the fence means the burst is observed while it is
-   * happening. */
-  {
-    static std::atomic<uint64_t> last_reported{0};
-    uint64_t lr = last_reported.load(std::memory_order_relaxed);
-    if (coherent_seq_id >= lr + 30 &&
-        last_reported.compare_exchange_strong(lr, coherent_seq_id, std::memory_order_relaxed))
-      mem_census_report("seq");
-  }
+  if (madeiraTextureDiagnosticsEnabled()) {
+    /* ml684: report on SEQUENCE ADVANCEMENT, not only on memory high-water marks.
+     * Every prior census fired on a rising HWM, so once the footprint plateaued
+     * near jetsam the reports stopped -- exactly when the retained set was most
+     * interesting. Sampling on the fence means the burst is observed while it is
+     * happening. */
+    {
+      static std::atomic<uint64_t> last_reported{0};
+      uint64_t lr = last_reported.load(std::memory_order_relaxed);
+      if (coherent_seq_id >= lr + 30 &&
+          last_reported.compare_exchange_strong(lr, coherent_seq_id, std::memory_order_relaxed))
+        mem_census_report("seq");
+    }
 
-  /* ml680 */
-  g_mem_census.dyn_seq_coherent.store(coherent_seq_id, std::memory_order_relaxed);
-  g_mem_census.dyn_fifo_depth.store(fifo.size(), std::memory_order_relaxed);
-  {
-    uint64_t d = fifo.size(), mx = g_mem_census.dyn_fifo_depth_max.load(std::memory_order_relaxed);
-    while (d > mx && !g_mem_census.dyn_fifo_depth_max.compare_exchange_weak(mx, d, std::memory_order_relaxed)) {}
-    uint64_t cur = g_mem_census.dyn_seq_current.load(std::memory_order_relaxed);
-    if (cur > coherent_seq_id) {
-      uint64_t lag = cur - coherent_seq_id, lm = g_mem_census.dyn_seq_lag_max.load(std::memory_order_relaxed);
-      while (lag > lm && !g_mem_census.dyn_seq_lag_max.compare_exchange_weak(lm, lag, std::memory_order_relaxed)) {}
+    /* ml680 */
+    g_mem_census.dyn_seq_coherent.store(coherent_seq_id, std::memory_order_relaxed);
+    g_mem_census.dyn_fifo_depth.store(fifo.size(), std::memory_order_relaxed);
+    {
+      uint64_t d = fifo.size(), mx = g_mem_census.dyn_fifo_depth_max.load(std::memory_order_relaxed);
+      while (d > mx && !g_mem_census.dyn_fifo_depth_max.compare_exchange_weak(mx, d, std::memory_order_relaxed)) {}
+      uint64_t cur = g_mem_census.dyn_seq_current.load(std::memory_order_relaxed);
+      if (cur > coherent_seq_id) {
+        uint64_t lag = cur - coherent_seq_id, lm = g_mem_census.dyn_seq_lag_max.load(std::memory_order_relaxed);
+        while (lag > lm && !g_mem_census.dyn_seq_lag_max.compare_exchange_weak(lm, lag, std::memory_order_relaxed)) {}
+      }
     }
   }
   if (out_minted_fresh)
     *out_minted_fresh = !ret.ptr();
   if (!ret.ptr()) {
-    g_mem_census.dyn_reuse_miss.fetch_add(1, std::memory_order_relaxed);
-    if (was_trimmed) g_trim_regret.fetch_add(1, std::memory_order_relaxed);   /* ml685 */
-    if (census_id_ < DYN_CENSUS_SLOTS) g_dyn_stats[census_id_].reuse_miss.fetch_add(1, std::memory_order_relaxed);
+    if (madeiraTextureDiagnosticsEnabled()) {
+      g_mem_census.dyn_reuse_miss.fetch_add(1, std::memory_order_relaxed);
+      if (was_trimmed) g_trim_regret.fetch_add(1, std::memory_order_relaxed);   /* ml685 */
+      if (census_id_ < DYN_CENSUS_SLOTS) g_dyn_stats[census_id_].reuse_miss.fetch_add(1, std::memory_order_relaxed);
+    }
     ret = buffer->allocate(flags_, "DynamicBuffer::allocate");
-  } else {
+  } else if (madeiraTextureDiagnosticsEnabled()) {
     g_mem_census.dyn_reuse_hit.fetch_add(1, std::memory_order_relaxed);
     if (census_id_ < DYN_CENSUS_SLOTS) {
       g_dyn_stats[census_id_].reuse_hit.fetch_add(1, std::memory_order_relaxed);
@@ -165,7 +185,7 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
 void
 DynamicBuffer::updateImmediateName(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation, uint32_t suballocation, bool owned_by_command_list) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
-  g_mem_census.dyn_seq_current.store(current_seq_id, std::memory_order_relaxed);   /* ml680 */
+  if (madeiraTextureDiagnosticsEnabled()) g_mem_census.dyn_seq_current.store(current_seq_id, std::memory_order_relaxed);   /* ml680 */
   if (!owned_by_command_list_ && census_id_ < DYN_CENSUS_SLOTS)
     g_dyn_stats[census_id_].push_update.fetch_add(1, std::memory_order_relaxed);   /* ml681 */
   if (!owned_by_command_list_)
@@ -222,7 +242,7 @@ DynamicLinearTexture::allocate(uint64_t coherent_seq_id) {
     if (fifo.empty()) {
       break;
     }
-    auto entry = fifo.front();
+    auto &entry = fifo.front();
     if (entry.will_free_at > coherent_seq_id) {
       break;
     }

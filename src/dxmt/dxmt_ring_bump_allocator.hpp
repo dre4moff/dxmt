@@ -198,7 +198,9 @@ public:
   public:
     WMT::Reference<WMT::Buffer> buffer;
     uint64_t gpu_address;
-    void *mapped_address;
+    void *mapped_address = nullptr;
+    // Non-owning pointer returned by newBuffer. Never freed by the block.
+    void *cpu_address = nullptr;
 
     ~Block() {
       mem_census_sub(MEMOWN_STAGING_RING, census_bytes);   /* ml677 */
@@ -228,6 +230,8 @@ public:
       buffer = std::move(move.buffer);
       gpu_address = move.gpu_address;
       mapped_address = move.mapped_address;
+      cpu_address = move.cpu_address;
+      move.cpu_address = nullptr;
       census_bytes = move.census_bytes;                    /* ml677: move the debt too */
       move.census_bytes = 0;
       move.mapped_address = nullptr;
@@ -266,6 +270,11 @@ public:
     info.memory.set(block.mapped_address);
     info.length = block_size;
     block.buffer = device_.newBuffer(info);
+#ifdef DXMT_IOS
+    // Remote handles require explicit updateContents delivery. Never bypass it.
+    if (block.buffer && !(block.buffer.handle & (1ull << 63)))
+      block.cpu_address = info.memory.ptr;
+#endif
     block.gpu_address = info.gpu_address;
     block.census_bytes = block_size;                       /* ml677 */
     mem_census_add(MEMOWN_STAGING_RING, block_size);

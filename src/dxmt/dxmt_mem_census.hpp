@@ -24,6 +24,7 @@
 #include <cstdio>
 #include "winemetal.h"
 #include "Metal.hpp"
+#include "util_madeira_switch.hpp"
 
 namespace dxmt {
 
@@ -186,6 +187,7 @@ mem_census_bucket(uint64_t n) {
  * reconciles against the owner total. */
 inline void
 mem_census_buffer_detail(uint64_t bytes, uint32_t storage_mode, uint32_t flag_bits, int add) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   BufSizeBucket b = mem_census_bucket(bytes);
   if (add) {
     g_mem_census.buf_bucket_live[b].fetch_add(bytes, std::memory_order_relaxed);
@@ -205,6 +207,7 @@ void mem_census_set_device(WMT::Device d);    /* ml696: BY VALUE, never a pointe
 
 inline void
 mem_census_add(MemOwner o, uint64_t bytes) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   if (!bytes) return;
   g_mem_census.requested[o].fetch_add(bytes, std::memory_order_relaxed);
   g_mem_census.allocs[o].fetch_add(1, std::memory_order_relaxed);
@@ -226,6 +229,7 @@ mem_census_add(MemOwner o, uint64_t bytes) {
 
 inline void
 mem_census_sub(MemOwner o, uint64_t bytes) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   if (!bytes) return;
   g_mem_census.frees[o].fetch_add(1, std::memory_order_relaxed);
   g_mem_census.live[o].fetch_sub(bytes, std::memory_order_relaxed);

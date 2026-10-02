@@ -28,7 +28,7 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     info_.memory.set(placed_buffer);
   }
   obj_ = device.newBuffer(info_);
-  g_live_bufalloc.created.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
+  if (madeiraTextureDiagnosticsEnabled()) g_live_bufalloc.created.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
   census_bytes_ = info_.length;                            /* ml677 */
   census_storage_ = ((uint32_t)info_.options >> 4) & 3;    /* ml678 storage mode */
   census_flags_ = flags_.raw();
@@ -46,7 +46,7 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
 };
 
 BufferAllocation::~BufferAllocation() {
-  g_live_bufalloc.destroyed.fetch_add(1, std::memory_order_relaxed);  /* ml684 */
+  if (madeiraTextureDiagnosticsEnabled()) g_live_bufalloc.destroyed.fetch_add(1, std::memory_order_relaxed);  /* ml684 */
   mem_census_sub(MEMOWN_BUFFER, census_bytes_);            /* ml677 */
   if (census_site_) buf_site_sub((uint64_t)(uintptr_t)census_site_, census_bytes_);  /* ml683 */
   mem_census_buffer_detail(census_bytes_, census_storage_, census_flags_, 0);  /* ml678 */
@@ -203,7 +203,7 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, const char *site) {
 
 Rc<BufferAllocation>
 Buffer::rename(Rc<BufferAllocation> &&newAllocation) {
-  g_mem_census.buf_renames.fetch_add(1, std::memory_order_relaxed);   /* ml678 */
+  if (madeiraTextureDiagnosticsEnabled()) g_mem_census.buf_renames.fetch_add(1, std::memory_order_relaxed);   /* ml678 */
   Rc<BufferAllocation> old = std::move(current_);
   current_ = std::move(newAllocation);
   return old;

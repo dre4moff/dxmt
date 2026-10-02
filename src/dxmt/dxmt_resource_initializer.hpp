@@ -110,7 +110,7 @@ private:
     return false;
   }
 
-  WMT::Buffer allocateGpuHeap(size_t size, size_t &offset);
+  WMT::Buffer allocateGpuHeap(size_t size, size_t &offset, void **cpu_address = nullptr);
 
   WMT::Buffer allocateZeroBuffer(size_t size);
 
@@ -119,6 +119,8 @@ private:
   uint64_t current_seq_id_ = 1;
   uint64_t cached_coherent_seq_id = 0;
   WMT::Device device_;
+  bool supports_bc_ = false;
+  bool direct_uploads_ = false;
   WMT::Reference<WMT::CommandQueue> upload_queue_;
   WMT::Reference<WMT::SharedEvent> upload_queue_event_;
   WMT::Reference<WMT::Buffer> zero_buffer_;

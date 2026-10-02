@@ -28,6 +28,7 @@ buf_site_find(uint64_t ra) {
 
 void
 buf_site_add(uint64_t ra, uint64_t bytes) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   BufSite *s = buf_site_find(ra);
   if (!s) return;
   s->live_bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -38,6 +39,7 @@ buf_site_add(uint64_t ra, uint64_t bytes) {
 
 void
 buf_site_sub(uint64_t ra, uint64_t bytes) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   BufSite *s = buf_site_find(ra);
   if (!s) return;
   s->live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
@@ -163,7 +165,11 @@ static WMT::Device g_census_device {};
 static bool g_census_device_valid = false;
 
 void
-mem_census_set_device(WMT::Device d) { g_census_device = d; g_census_device_valid = true; }
+mem_census_set_device(WMT::Device d) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
+  g_census_device = d;
+  g_census_device_valid = true;
+}
 
 /* ml998: THE CENSUS WAS COSTING MORE THAN WHAT IT MEASURES.
  *
@@ -223,6 +229,7 @@ mem_census_throttled(const char *why) {
 
 void
 mem_census_report(const char *why) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   uint64_t tl = 0, tp = 0, tr = 0;
 
   if (mem_census_throttled(why)) return;

@@ -60,4 +60,15 @@ madeiraSwitch(const char *name) {
   return value != "0";
 }
 
+// Detailed resource diagnostics must not inspect COM resources or lock counters
+// during quiet gameplay. The developer's explicit profiling choice wins.
+inline bool madeiraTextureDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const auto choice = env::getEnvVar("MADEIRA_RUNTIME_PROFILING");
+    if (!choice.empty()) return choice == "1";
+    return env::getEnvVar("MADEIRA_QUIET") != "1";
+  }();
+  return enabled;
+}
+
 } // namespace dxmt

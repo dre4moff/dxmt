@@ -11,15 +11,11 @@
 namespace dxmt {
 Logger Logger::s_instance("nvngx.log");
 
-#define IMPLEMENT_ME                                                                                                   \
-  Logger::err(str::format(__FILE__, ":", __FUNCTION__, " is not implemented."));                                       \
-  abort();                                                                                                             \
-  __builtin_unreachable();
-
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_Init_Ext(
     unsigned long long id, const wchar_t *path, ID3D11Device *device, unsigned int sdk_version, const void *feature_info
 ) {
+  Logger::info("[dlss-metalfx] NGX D3D11 init");
   return NVNGX_RESULT_OK;
 }
 
@@ -50,6 +46,8 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_CreateFeature(
     ID3D11DeviceContext *context, unsigned int feature, NVNGXParameter *params, unsigned int **out_handle
 ) {
+  if (!context || !params || !out_handle) return NVNGX_RESULT_INVALID_PARAMETER;
+  *out_handle = nullptr;
   auto parameters = static_cast<ParametersImpl *>(params);
   Com<IMTLD3D11ContextExt1> pCtxExt = nullptr;
   if (FAILED(context->QueryInterface(IID_PPV_ARGS(&pCtxExt))))
@@ -78,6 +76,11 @@ NVSDK_NGX_D3D11_CreateFeature(
     if (NVNGX_FAILED(parameters->Get("DLSS.Enable.Output.Subrects", &dlss->enable_output_subrects)))
       dlss->enable_output_subrects = 0;
 
+    if (!dlss->width || !dlss->height || dlss->width > dlss->target_width || dlss->height > dlss->target_height ||
+        dlss->target_width > 16384 || dlss->target_height > 16384 || (dlss->flag & NVNGX_DLSS_FLAG_MV_JITTERED))
+      return NVNGX_RESULT_INVALID_PARAMETER;
+    if (dlss->width * 2 < dlss->target_width || dlss->height * 2 < dlss->target_height)
+      return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
     *out_handle = &dlss.release()->handle;
     return NVNGX_RESULT_OK;
   }
@@ -90,16 +93,17 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_EvaluateFeature(
     ID3D11DeviceContext *context, const unsigned int *handle, NVNGXParameter *params, void *callback
 ) {
+  if (!context || !handle || !params) return NVNGX_RESULT_INVALID_PARAMETER;
   auto parameters = static_cast<ParametersImpl *>(params);
   switch (static_cast<CommonFeature *>((void *)handle)->feature) {
   case NVNGX_FEATURE_SUPERSAMPLING: {
     auto dlss = static_cast<DLSSFeature *>((void *)handle);
 
-    IMTLD3D11ContextExt *pCtxExt = nullptr;
+    Com<IMTLD3D11ContextExt> pCtxExt = nullptr;
     if (FAILED(context->QueryInterface(IID_PPV_ARGS(&pCtxExt))))
       return NVNGX_RESULT_INVALID_PARAMETER;
 
-    ID3D11Texture2D *input, *output, *depth, *mv, *exposure = nullptr;
+    ID3D11Texture2D *input = nullptr, *output = nullptr, *depth = nullptr, *mv = nullptr, *exposure = nullptr;
 
     if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Color, (ID3D11Resource **)&input)))
       return NVNGX_RESULT_INVALID_PARAMETER;
@@ -110,12 +114,14 @@ NVSDK_NGX_D3D11_EvaluateFeature(
     if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MotionVectors, (ID3D11Resource **)&mv)))
       return NVNGX_RESULT_INVALID_PARAMETER;
     parameters->Get(NVNGX_Parameter_ExposureTexture, (ID3D11Resource **)&exposure);
+    if (!input || !output || !depth || !mv) return NVNGX_RESULT_INVALID_PARAMETER;
 
-    uint32_t width = 0, height = 0;
-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &width)))
-      return NVNGX_RESULT_INVALID_PARAMETER;
-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &height)))
-      return NVNGX_RESULT_INVALID_PARAMETER;
+    uint32_t width = dlss->width, height = dlss->height;
+    parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &width);
+    parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &height);
+    if (!width || !height || width > dlss->target_width || height > dlss->target_height) return NVNGX_RESULT_INVALID_PARAMETER;
+    if (width * 2 < dlss->target_width || height * 2 < dlss->target_height)
+      return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
 
     MTL_TEMPORAL_UPSCALE_D3D11_DESC desc = {};
     desc.InputContentWidth = width;
@@ -137,19 +143,25 @@ NVSDK_NGX_D3D11_EvaluateFeature(
 
     int reset = 0;
     parameters->Get(NVNGX_Parameter_Reset, &reset);
-    desc.InReset = reset;
+    desc.InReset = reset || !dlss->evaluated;
 
     if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_X, &desc.MotionVectorScaleX)))
       desc.MotionVectorScaleX = 1.0;
     if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_Y, &desc.MotionVectorScaleY)))
       desc.MotionVectorScaleY = 1.0;
     if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Pre_Exposure, &desc.PreExposure)))
-      desc.PreExposure = 0;
+      desc.PreExposure = 1.0f;
+    if (desc.PreExposure == 0.0f) desc.PreExposure = 1.0f;
 
-    pCtxExt->TemporalUpscale(&desc);
+    Com<IMTLD3D11ContextExt2> checked = nullptr;
+    if (FAILED(context->QueryInterface(IID_PPV_ARGS(&checked)))) return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+    auto result = checked->TryTemporalUpscale(&desc);
+    if (FAILED(result)) {
+      ERR("[dlss-metalfx] D3D11 evaluate rejected HRESULT=", result);
+      return result == E_INVALIDARG ? NVNGX_RESULT_INVALID_PARAMETER : NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+    }
 
-    pCtxExt->Release();
-
+    dlss->evaluated = true;
     return NVNGX_RESULT_OK;
     break;
   }
@@ -171,12 +183,14 @@ NVSDK_NGX_D3D11_Shutdown1(ID3D11Device *device) {
 
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_GetScratchBufferSize(unsigned int feature, const NVNGXParameter *params, size_t *out_size) {
-  IMPLEMENT_ME
-  return NVNGX_RESULT_FAIL;
+  if (!out_size) return NVNGX_RESULT_INVALID_PARAMETER;
+  *out_size = 0; // MetalFX owns its scratch resources; NGX needs no caller buffer.
+  return feature == NVNGX_FEATURE_SUPERSAMPLING ? NVNGX_RESULT_OK : NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
 }
 
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_ReleaseFeature(unsigned int *handle) {
+  if (!handle) return NVNGX_RESULT_INVALID_PARAMETER;
   switch (static_cast<CommonFeature *>((void *)handle)->feature) {
   case NVNGX_FEATURE_SUPERSAMPLING:
     delete static_cast<DLSSFeature *>((void *)handle);
@@ -195,6 +209,7 @@ NVSDK_NGX_D3D11_DestroyParameters(NVNGXParameter *params) {
 
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_AllocateParameters(NVNGXParameter **out_params) {
+  if (!out_params) return NVNGX_RESULT_INVALID_PARAMETER;
   *out_params = new ParametersImpl();
   return NVNGX_RESULT_OK;
 }
@@ -221,7 +236,7 @@ NVNGX_DLSS_GetOptimalSettingsCallback(NVNGXParameter *params) {
 
   switch (perf_quality_value) {
   case NVNGX_PERFQUALITY_ULTRA_PERFORMANCE:
-    scale = 1.0f / 3.0f;
+    scale = 0.5f; // mobile MetalFX maximum is 2x, including Ultra Performance
     break;
   case NVNGX_PERFQUALITY_MAXPERF:
     scale = 0.5f;
@@ -249,8 +264,8 @@ NVNGX_DLSS_GetOptimalSettingsCallback(NVNGXParameter *params) {
   params->Set(NVNGX_Parameter_OutHeight, out_height);
   params->Set(NVNGX_Parameter_Sharpness, 0.0f);
 
-  params->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, (unsigned int)std::ceil(width / 3));
-  params->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, (unsigned int)std::ceil(height / 3));
+  params->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, (unsigned int)std::ceil(width / 2.0f));
+  params->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, (unsigned int)std::ceil(height / 2.0f));
 
   params->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, width);
   params->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, height);
@@ -275,6 +290,7 @@ NVNGX_DLSS_GetStatsCallback(NVNGXParameter *params) {
 
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_GetCapabilityParameters(NVNGXParameter **out_params) {
+  if (!out_params) return NVNGX_RESULT_INVALID_PARAMETER;
   auto out_parameters = new ParametersImpl();
 
   out_parameters->Set("SuperSampling.Available", 1u);
@@ -317,7 +333,7 @@ NVSDK_NGX_D3D11_GetFeatureRequirements(
     IDXGIAdapter *adapter, const NVNGX_FeatureDiscoveryInfo *discovery_info,
     NVNGX_FeatureRequirement *requirement
 ) {
-  if (!requirement)
+  if (!requirement || !discovery_info)
     return NVNGX_RESULT_INVALID_PARAMETER;
   if (discovery_info->FeatureID == NVNGX_FEATURE_SUPERSAMPLING) {
     requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_SUPPORTED;
@@ -330,12 +346,16 @@ NVSDK_NGX_D3D11_GetFeatureRequirements(
   return NVNGX_RESULT_FAIL;
 }
 
+}; // namespace dxmt
+#include "nvngx_d3d12.hpp"
+namespace dxmt {
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
                                LPVOID reserved) {
   if (reason != DLL_PROCESS_ATTACH)
     return TRUE;
 
   DisableThreadLibraryCalls(instance);
+  Logger::info("[dlss-metalfx] NGX shim loaded (D3D11 + Madeira D3D12)");
 
   if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {
     return FALSE;

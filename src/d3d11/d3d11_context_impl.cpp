@@ -1,3 +1,4 @@
+#include <cmath>
 
 /**
 This file is included by d3d11_context_{imm|def}.cpp
@@ -625,6 +626,7 @@ inline std::atomic<uint32_t> g_cp_bc_stg_decoded{0};   /* ml747 */
 inline std::atomic<uint32_t> g_cp_bc_stg_fail{0};      /* ml747 */
 
 inline void BCStreamReport() {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   static std::atomic<uint32_t> tick{0};
   if ((tick.fetch_add(1, std::memory_order_relaxed) & 0x3FF) != 0)
     return;
@@ -695,7 +697,7 @@ public:
       return S_OK;
     }
 
-    if (riid == __uuidof(IMTLD3D11ContextExt) || riid == __uuidof(IMTLD3D11ContextExt1)) {
+    if (riid == __uuidof(IMTLD3D11ContextExt) || riid == __uuidof(IMTLD3D11ContextExt1) || riid == __uuidof(IMTLD3D11ContextExt2)) {
       *ppvObject = ref(&ext_);
       return S_OK;
     }
@@ -1101,7 +1103,7 @@ public:
   void
   STDMETHODCALLTYPE
   CopyResource(ID3D11Resource *pDstResource, ID3D11Resource *pSrcResource) override {
-    BCCensusRecordOp(BCCensusFormatOf(pDstResource), 1);  /* ml653 */
+    if (madeiraTextureDiagnosticsEnabled()) BCCensusRecordOp(BCCensusFormatOf(pDstResource), 1);  /* ml653 */
     std::lock_guard<mutex_t> lock(mutex);
 
     BlitObject Dst(device, pDstResource);
@@ -1158,7 +1160,7 @@ public:
       ID3D11Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource *pSrcResource,
       UINT SrcSubresource, const D3D11_BOX *pSrcBox, UINT CopyFlags
   ) override {
-    BCCensusRecordOp(BCCensusFormatOf(pDstResource), 2);  /* ml653 */
+    if (madeiraTextureDiagnosticsEnabled()) BCCensusRecordOp(BCCensusFormatOf(pDstResource), 2);  /* ml653 */
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!pDstResource)
@@ -1226,7 +1228,7 @@ public:
       ID3D11Resource *pDstResource, UINT DstSubresource, const D3D11_BOX *pDstBox, const void *pSrcData,
       UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags
   ) override {
-    BCCensusRecordOp(BCCensusFormatOf(pDstResource), 0);  /* ml653 */
+    if (madeiraTextureDiagnosticsEnabled()) BCCensusRecordOp(BCCensusFormatOf(pDstResource), 0);  /* ml653 */
     BCStreamReport();  /* ml744 */
     std::lock_guard<mutex_t> lock(mutex);
 
@@ -5131,14 +5133,14 @@ public:
 };
 
 template <typename ContextInternalState>
-class MTLD3D11ContextExt : public IMTLD3D11ContextExt1 {
+class MTLD3D11ContextExt : public IMTLD3D11ContextExt2 {
   class CachedTemporalScaler {
   public:
     WMTPixelFormat color_pixel_format;
     WMTPixelFormat output_pixel_format;
     WMTPixelFormat depth_pixel_format;
     WMTPixelFormat motion_vector_pixel_format;
-    bool auto_exposure;
+    bool auto_exposure, highres_motion;
     uint32_t input_width;
     uint32_t input_height;
     uint32_t output_width;
@@ -5183,29 +5185,40 @@ public:
   }
 
   void STDMETHODCALLTYPE TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D11_DESC *pDesc) final {
+    (void)TryTemporalUpscale(pDesc);
+  }
+
+  HRESULT STDMETHODCALLTYPE TryTemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D11_DESC *pDesc) final {
+    if (!pDesc || !pDesc->Color || !pDesc->Output || !pDesc->Depth || !pDesc->MotionVector ||
+        !std::isfinite(pDesc->PreExposure) || pDesc->PreExposure <= 0 ||
+        !std::isfinite(pDesc->MotionVectorScaleX) || !std::isfinite(pDesc->MotionVectorScaleY) ||
+        !std::isfinite(pDesc->JitterOffsetX) || !std::isfinite(pDesc->JitterOffsetY)) return E_INVALIDARG;
     Rc<Texture> input, output, depth, motion_vector, exposure;
     if (!(input = static_cast<D3D11ResourceCommon *>(pDesc->Color)->texture()))
-      return;
+      return E_INVALIDARG;
     if (!(output = static_cast<D3D11ResourceCommon *>(pDesc->Output)->texture()))
-      return;
+      return E_INVALIDARG;
     if (!(depth = static_cast<D3D11ResourceCommon *>(pDesc->Depth)->texture()))
-      return;
+      return E_INVALIDARG;
     if (!(motion_vector = static_cast<D3D11ResourceCommon *>(pDesc->MotionVector)->texture()))
-      return;
+      return E_INVALIDARG;
     if (pDesc->ExposureTexture && !(exposure = static_cast<D3D11ResourceCommon *>(pDesc->ExposureTexture)->texture()))
-      return;
+      return E_INVALIDARG;
 
     WMTPixelFormat motion_vector_format = GetCorrectMotionVectorFormat(motion_vector->pixelFormat());
     if (motion_vector_format == WMTPixelFormatInvalid) {
       ERR("TemporalUpscale: invalid motion vector format ", motion_vector->pixelFormat());
-      return;
+      return E_INVALIDARG;
     }
 
+    if (input == output || pDesc->InputContentWidth > input->width() || pDesc->InputContentHeight > input->height() ||
+        input->width() > output->width() || input->height() > output->height()) return E_INVALIDARG;
     WMT::Reference<WMT::FXTemporalScaler> scaler;
     Rc<Texture> mv_downscaled;
 
     for(CachedTemporalScaler& entry: scaler_cache_) {
       if(pDesc->AutoExposure != entry.auto_exposure) continue;
+      if(bool(pDesc->MotionVectorInDisplayRes) != entry.highres_motion) continue;
       if(input->width() != entry.input_width) continue;
       if(input->height() != entry.input_height) continue;
       if(output->width() != entry.output_width) continue;
@@ -5232,6 +5245,7 @@ public:
       info.depth_format = scaler_entry.depth_pixel_format;
       info.motion_format = motion_vector_format;
       scaler_entry.auto_exposure = pDesc->AutoExposure;
+      scaler_entry.highres_motion = pDesc->MotionVectorInDisplayRes;
       scaler_entry.input_width = input->width();
       scaler_entry.input_height = input->height();
       scaler_entry.output_width = output->width();
@@ -5246,6 +5260,12 @@ public:
       info.input_content_max_scale =  3.0f;
       info.requires_synchronous_initialization = true;
       scaler_entry.scaler = ctx_->device->GetMTLDevice().newTemporalScaler(info);
+      if (!scaler_entry.scaler) {
+        ERR("[dlss-metalfx] temporal scaler creation failed");
+        return E_NOTIMPL;
+      }
+      Logger::info(str::format("[dlss-metalfx] temporal scaler active input=", info.input_width, "x",
+          info.input_height, " output=", info.output_width, "x", info.output_height));
       if (pDesc->MotionVectorInDisplayRes) {
         WMTTextureInfo tex_info;
         tex_info.width = scaler_entry.input_width;
@@ -5318,6 +5338,7 @@ public:
         enc.upscaleTemporal(input, output, depth, motion_vector, mv_view, exposure, scaler, props);
       }
     });
+    return S_OK;
   }
 
   void STDMETHODCALLTYPE BeginUAVOverlap() final {

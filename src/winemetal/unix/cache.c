@@ -17,7 +17,7 @@
 @interface CacheReader () {
   sqlite3 *_db;
   sqlite3_stmt *_stmt;
-  uint64_t _hits, _misses;
+  uint64_t _hits, _misses, _errors;
   bool _stats;
 }
 @end
@@ -64,6 +64,11 @@ resolve_ios_cache_dir(NSString *path, bool path_is_file) {
                                                   attributes:nil
                                                        error:nil])
     return nil;
+  // Mark the owned game cache directory as recently used even on pure cache hits.
+  // This prevents idle housekeeping from mistaking a warm read-only DB for junk.
+  NSString *used_dir = path_is_file ? [path stringByDeletingLastPathComponent] : path;
+  [[NSFileManager defaultManager] setAttributes:@{NSFileModificationDate: [NSDate date]}
+                                 ofItemAtPath:used_dir error:nil];
   return path;
 }
 #endif
@@ -118,6 +123,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
       sqlite3_close(_db);
       return nil;
     }
+    if (_stats) NSLog(@"[shader-cache] r19 reader-open version=%llu", version);
   }
   return self;
 }
@@ -128,17 +134,19 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
   sqlite3_bind_blob64(_stmt, 1, key.bytes, key.length, SQLITE_STATIC);
 
   dispatch_data_t result = nil;
-  if (sqlite3_step(_stmt) == SQLITE_ROW) {
+  int status = sqlite3_step(_stmt);
+  if (status == SQLITE_ROW) {
     const void *bytes = sqlite3_column_blob(_stmt, 0);
     int len = sqlite3_column_bytes(_stmt, 0);
     result = dispatch_data_create(bytes, len, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
   }
   sqlite3_reset(_stmt);
   if (_stats) {
+    if (status != SQLITE_ROW && status != SQLITE_DONE) ++_errors;
     if (result) ++_hits; else ++_misses;
     uint64_t count = _hits + _misses;
     if (count == 1 || count == 64 || count == 256 || !(count % 1024))
-      NSLog(@"[shader-cache] ml1160 hits=%llu misses=%llu", _hits, _misses);
+      NSLog(@"[shader-cache] r19 hits=%llu misses=%llu read-errors=%llu", _hits, _misses, _errors);
   }
   return result;
 }

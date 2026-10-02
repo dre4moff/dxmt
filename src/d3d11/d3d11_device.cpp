@@ -30,6 +30,7 @@
 #include "config/config.hpp"   /* ml670: d3d11.mipClampBC */
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
+#include "util_madeira_switch.hpp"
 
 namespace dxmt {
 
@@ -127,6 +128,7 @@ void BCCensusDump(const char *why) {
 }
 
 void BCCensusRecord(const D3D11_TEXTURE2D_DESC1 *d, const D3D11_SUBRESOURCE_DATA *data) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   const uint32_t f = (uint32_t)d->Format;
   if (!IsBCFormat(f) || f >= kDxgiMax) return;
 
@@ -183,12 +185,14 @@ void BCCensusRecord(const D3D11_TEXTURE2D_DESC1 *d, const D3D11_SUBRESOURCE_DATA
 
 /* ml653: reachable from d3d11_context_impl.cpp (different TU). */
 extern "C" void BCCensusRecordSRV(unsigned int fmt) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   if (!IsBCFormat(fmt) || fmt >= kDxgiMax) return;
   std::lock_guard<std::mutex> lk(g_bc_census_mutex);
   g_bc_srv_formats[fmt]++;
 }
 
 extern "C" void BCCensusRecordOp(unsigned int fmt, int op) {
+  if (!madeiraTextureDiagnosticsEnabled()) return;
   if (!IsBCFormat(fmt)) return;
   std::lock_guard<std::mutex> lk(g_bc_census_mutex);
   switch (op) {

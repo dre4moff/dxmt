@@ -8,6 +8,7 @@
 #include "dxmt_mem_census.hpp"
 #include "dxmt_bcn.hpp"
 #include "util_madeira_switch.hpp"
+#include "dxmt_texture_upload.hpp"
 
 namespace dxmt {
 
@@ -51,6 +52,10 @@ ResourceInitializer::ResourceInitializer(WMT::Device device) :
     gpu_command_heap_allocator(StagingBufferBlockAllocator(
         device, WMTResourceStorageModeManaged | WMTResourceHazardTrackingModeUntracked, false
     )) {
+  supports_bc_ = device.supportsBCTextureCompression();
+#ifdef DXMT_IOS
+  direct_uploads_ = env::getEnvVar("DXMT_DIRECT_TEXTURE_UPLOAD") == "1";
+#endif
   upload_queue_ = device.newCommandQueue(kResourceInitializerChunks);
   upload_queue_event_ = device.newSharedEvent();
 
@@ -483,7 +488,7 @@ ResourceInitializer::initWithData(
    * pattern in the CORRECT physical format. Bounded, obviously synthetic, and
    * diagnostic: if geometry lights up in these colours then missing BC formats
    * are the whole story, and if it stays black the problem is elsewhere. */
-  if (!is_3d_tex && !device_.supportsBCTextureCompression() &&
+  if (!is_3d_tex && !supports_bc_ &&
       bc_decode_kind(texture->pixelFormat()) == 0 && bc_is_unsupported_src(texture->pixelFormat())) {
     /* ml679: BC1/BC2/BC3/BC4/BC5/BC7 all decode for real now, so only BC6H
      * still reaches this fill. Keeping the path (rather than deleting it) is
@@ -511,7 +516,7 @@ ResourceInitializer::initWithData(
   }
 
   const int bc_kind = bc_decode_kind(texture->pixelFormat());
-  if (bc_kind && !is_3d_tex && !device_.supportsBCTextureCompression()) {
+  if (bc_kind && !is_3d_tex && !supports_bc_) {
     const uint32_t out_texel = bc_decode_texel_size(bc_kind);
     const size_t out_bytes = (size_t)width_sub * height_sub * out_texel;
     decoded.reset(new (std::nothrow) uint8_t[out_bytes]);
@@ -549,7 +554,18 @@ ResourceInitializer::initWithData(
   do {
     RETAIN(allocation);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
-    ALLOC_GPU(temp, total_bytes_needed);
+    WMT::Buffer temp;
+    size_t temp_offset;
+    void *cpu_address = nullptr;
+    if (!(temp = allocateGpuHeap(total_bytes_needed, temp_offset, &cpu_address))) {
+      flushInternal(); continue;
+    }
+    if (direct_uploads_ && cpu_address) {
+      copyTextureUpload(static_cast<char *>(cpu_address) + temp_offset, data,
+                        align(height_sub, block_size) / block_size, depth_sub,
+                        bytes_per_row_needed, bytes_per_row_increment, bytes_per_image_increment,
+                        bytes_per_row_valid, bytes_per_image_valid);
+    } else {
 
     for (auto depth = 0u; depth < depth_sub; depth++) {
       if (bytes_per_row_increment != bytes_per_row_needed) {
@@ -565,6 +581,7 @@ ResourceInitializer::initWithData(
         auto src_data = ptr_add(data, depth * bytes_per_image_increment);
         temp.updateContents(offset, src_data, length);
       }
+    }
     }
 
     copy->type = WMTBlitCommandCopyFromBufferToTexture;
@@ -647,11 +664,12 @@ ResourceInitializer::encode(WMT::CommandBuffer cmdbuf) {
 }
 
 WMT::Buffer
-ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset) {
+ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset, void **cpu_address) {
   auto [block, offset_] = gpu_command_heap_allocator.allocate(
       current_seq_id_, cached_coherent_seq_id, size, kResourceInitializerGpuUploadHeapAlignment
   );
   offset = offset_;
+  if (cpu_address) *cpu_address = block.cpu_address;
   return block.buffer;
 }
 
