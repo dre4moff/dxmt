@@ -134,9 +134,22 @@ endif
 
 xcrun = find_program('xcrun')
 
+# The embedded shaders are loaded by MTLDevice::newLibrary on whatever OS runs
+# the app, and an OS refuses a library written for a newer Metal language
+# version than it knows ("This library is using language version 4.1 which is
+# not supported on this OS"). Left to its default, the compiler uses the
+# newest version of the Xcode that happens to build the DLL, so the same
+# source works or fails depending on the build machine and the device. Pin the
+# standard and the AIR target to what the shaders need and every supported
+# device accepts; the runtime-translated shaders are already stamped the same
+# way (metallib_writer.cpp). -Dmetal_std overrides when the shaders grow a
+# newer requirement.
+metal_std = get_option('metal_std')
+
 metalir_generator = generator(xcrun,
   output    : [ '@BASENAME@.air'],
-  arguments : [ '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
+  arguments : [ '-sdk', 'macosx', 'metal', '-std=' + metal_std, '--target=air64-apple-macos14.0',
+                '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
 )
 
 metallib_generator = generator(xcrun,
@@ -164,7 +177,7 @@ endif
 
 # MADEIRA (WOW64_DESIGN.md section 8): every change to an imported DXMT file
 # is gated on this, so a diff against the v0.4-d3d9 tag stays readable and
-# every gate is listed in research/dxmt/LICENSE-MADEIRA.md (section 8.9 risk 2).
+# every gate is listed in dxmt/LICENSE-MADEIRA.md (section 8.9 risk 2).
 if dxmt_madeira
 add_project_arguments('-DDXMT_MADEIRA=1', language: 'cpp')
 add_project_arguments('-DDXMT_MADEIRA=1', language: 'c')

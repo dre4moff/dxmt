@@ -4206,7 +4206,7 @@ thunk32_SM50GetArgumentsInfo(void *args) {
   return STATUS_SUCCESS;
 }
 /* MADEIRA (WOW64_DESIGN.md section 7): imported from dacevedo12/dxmt
- * tag v0.4-d3d9 (LGPL-2.1-or-later, see research/dxmt/LICENSE-MADEIRA.md).
+ * tag v0.4-d3d9 (LGPL-2.1-or-later, see dxmt/LICENSE-MADEIRA.md).
  * Unchanged except that UInt32ToPtr above is the guest-window conversion
  * (+B) on iOS rather than a bare zero-extension, which is what makes the
  * embedded `elements` / `next` / bytecode pointers usable here. */
