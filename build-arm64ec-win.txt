@@ -1,9 +1,9 @@
 [binaries]
-c = '@GLOBAL_SOURCE_ROOT@' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-clang'
-cpp = '@GLOBAL_SOURCE_ROOT@' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-clang++'
-ar = '@GLOBAL_SOURCE_ROOT@' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-ar'
-strip = '@GLOBAL_SOURCE_ROOT@' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-strip'
-windres = '@GLOBAL_SOURCE_ROOT@' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-windres'
+c = '@DIRNAME@' / '..' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-clang'
+cpp = '@DIRNAME@' / '..' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-clang++'
+ar = '@DIRNAME@' / '..' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-ar'
+strip = '@DIRNAME@' / '..' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-strip'
+windres = '@DIRNAME@' / '..' / 'toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-windres'
 
 [properties]
 needs_exe_wrapper = true
