@@ -55,6 +55,9 @@ ResourceInitializer::ResourceInitializer(WMT::Device device) :
   supports_bc_ = device.supportsBCTextureCompression();
 #ifdef DXMT_IOS
   direct_uploads_ = env::getEnvVar("DXMT_DIRECT_TEXTURE_UPLOAD") == "1";
+  Logger::info(str::format("[texture-stream] staging-block=", kResourceInitializerGpuUploadHeapSize,
+               " direct=", direct_uploads_, " completed-reuse=", kCompactTextureStaging,
+               " init-batch-limit=", kCompactTextureStaging ? (64u << 20) : 0));
 #endif
   upload_queue_ = device.newCommandQueue(kResourceInitializerChunks);
   upload_queue_event_ = device.newSharedEvent();
@@ -597,7 +600,20 @@ ResourceInitializer::initWithData(
 
   } while (0);
 
-  return current_seq_id_;
+  return finishUploadBatch();
+}
+
+uint64_t
+ResourceInitializer::finishUploadBatch() {
+  // Return the sequence that owns this copy, including when we submit it now.
+  // The two-buffer upload queue supplies its existing GPU backpressure. Bound
+  // pending data independently of the much larger CPU command heap capacity.
+  const uint64_t seq_id = current_seq_id_;
+#if defined(DXMT_IOS) && !defined(DXMT_MADEIRA) && !defined(__i386__)
+  if (pending_upload_bytes_ >= (64u << 20))
+    flushInternal();
+#endif
+  return seq_id;
 }
 
 std::uint64_t
@@ -634,6 +650,9 @@ ResourceInitializer::flushToWait() {
 
 void
 ResourceInitializer::reset() {
+#if defined(DXMT_IOS) && !defined(DXMT_MADEIRA) && !defined(__i386__)
+  pending_upload_bytes_ = 0;
+#endif
   cpu_command_heap_offset = 0;
 
   clear_render_pass_head.next = nullptr;
@@ -670,6 +689,9 @@ ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset, void **cpu_add
   );
   offset = offset_;
   if (cpu_address) *cpu_address = block.cpu_address;
+#if defined(DXMT_IOS) && !defined(DXMT_MADEIRA) && !defined(__i386__)
+  if (block.buffer) pending_upload_bytes_ += size;
+#endif
   return block.buffer;
 }
 

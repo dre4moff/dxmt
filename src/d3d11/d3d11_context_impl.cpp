@@ -27,6 +27,7 @@ since it is for internal use only
 #include "dxmt_staging.hpp"
 #include "d3d11_resource.hpp"
 #include "dxmt_texture.hpp"
+#include "dxmt_texture_upload.hpp"
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
@@ -3009,7 +3010,8 @@ public:
 
   template <typename T> moveonly_list<T> AllocateCommandData(size_t n = 1);
 
-  std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment);
+  std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment,
+                                                       void **cpu_address = nullptr);
   void UseCopyDestination(Rc<StagingResource> &);
   void UseCopySource(Rc<StagingResource> &);
 
@@ -4114,9 +4116,23 @@ public:
         cmd.EffectiveRows = cmd.DstSize.height;
         g_bc_stream_ok[bc_kind & 15].fetch_add(1, std::memory_order_relaxed);
       }
-      auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
-      auto [staging_buffer, offset] = AllocateStagingBuffer(bytes_per_depth_slice * cmd.DstSize.depth, 16);
-      if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
+      const size_t bytes_per_depth_slice = size_t(cmd.EffectiveRows) * cmd.EffectiveBytesPerRow;
+      void *cpu_address = nullptr;
+      auto [staging_buffer, offset] = AllocateStagingBuffer(
+          bytes_per_depth_slice * cmd.DstSize.depth, 16, &cpu_address);
+#ifdef DXMT_IOS
+      static const bool direct_uploads = env::getEnvVar("DXMT_DIRECT_TEXTURE_UPLOAD") == "1";
+#else
+      constexpr bool direct_uploads = false;
+#endif
+      // The ring supplies a fresh suballocation; its existing GPU/command-list
+      // fences retain the backing. Remote handles never expose cpu_address.
+      if (direct_uploads && cpu_address) {
+        copyTextureUpload(static_cast<char *>(cpu_address) + offset, pSrcData,
+                          cmd.EffectiveRows, cmd.DstSize.depth,
+                          cmd.EffectiveBytesPerRow, SrcRowPitch, SrcDepthPitch,
+                          cmd.EffectiveBytesPerRow, bytes_per_depth_slice);
+      } else if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
         for (unsigned depthSlice = 0; depthSlice < cmd.DstSize.depth; depthSlice++) {
           auto dst_offset = offset + depthSlice * bytes_per_depth_slice;
           const char *src = ((const char *)pSrcData) + depthSlice * SrcDepthPitch;
@@ -5463,8 +5479,9 @@ public:
   }
 
   std::tuple<WMT::Buffer, uint64_t>
-  AllocateStagingBuffer(size_t size, size_t alignment) {
+  AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address = nullptr) {
     auto [block, offset] = staging_allocator.allocate(1, 0, size, alignment);
+    if (cpu_address) *cpu_address = block.cpu_address;
     return {block.buffer, offset};
   }
 

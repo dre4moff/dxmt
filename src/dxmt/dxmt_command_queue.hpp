@@ -198,7 +198,8 @@ private:
     return encoder_seq++;
   }
 
-  RingBumpState<StagingBufferBlockAllocator> staging_allocator;
+  RingBumpState<StagingBufferBlockAllocator, kTextureUploadBlockSize,
+                dxmt::mutex, kCompactTextureStaging> staging_allocator;
   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator;
   RingBumpState<StagingBufferBlockAllocator, kCommandChunkGPUHeapSize> argbuf_allocator;
   RingBumpState<HostBufferBlockAllocator, kCommandChunkCPUHeapSize, dxmt::null_mutex> cpu_command_allocator;
@@ -338,8 +339,9 @@ public:
   bool WaitCPUFenceBounded(uint64_t seq, uint64_t timeout_ns);
 
   std::tuple<WMT::Buffer, uint64_t>
-  AllocateStagingBuffer(size_t size, size_t alignment) {
+  AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address = nullptr) {
     auto [block, offset] = staging_allocator.allocate(ready_for_encode, cpu_coherent.signaledValue(), size, alignment);
+    if (cpu_address) *cpu_address = block.cpu_address;
     return {block.buffer, offset};
   }
 
