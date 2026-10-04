@@ -123,9 +123,10 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
       }
       if (freed_n) {
         trimmed_last_ = true;                  /* ml685: for trim-regret */
+        // Constant-cost release counters remain available with detailed census off.
+        g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
+        g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
         if (madeiraTextureDiagnosticsEnabled()) {
-          g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
-          g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
           if (stats) {
             DynStat &st = g_dyn_stats[census_id_];
             st.trimmed_n.fetch_add(freed_n, std::memory_order_relaxed);
@@ -166,9 +167,9 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
   if (out_minted_fresh)
     *out_minted_fresh = !ret.ptr();
   if (!ret.ptr()) {
+    if (was_trimmed) g_trim_regret.fetch_add(1, std::memory_order_relaxed);
     if (madeiraTextureDiagnosticsEnabled()) {
       g_mem_census.dyn_reuse_miss.fetch_add(1, std::memory_order_relaxed);
-      if (was_trimmed) g_trim_regret.fetch_add(1, std::memory_order_relaxed);   /* ml685 */
       if (census_id_ < DYN_CENSUS_SLOTS) g_dyn_stats[census_id_].reuse_miss.fetch_add(1, std::memory_order_relaxed);
     }
     ret = buffer->allocate(flags_, "DynamicBuffer::allocate");

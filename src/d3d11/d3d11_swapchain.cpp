@@ -9,6 +9,7 @@
 #include "dxmt_context.hpp"
 #include "dxmt_hud_state.hpp"
 #include "dxmt_statistics.hpp"
+#include "dxmt_mem_census.hpp"
 #include "dxmt_presenter.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
@@ -975,6 +976,13 @@ public:
             average.drawable_blocking_interval.count() / 1000000.0,
             frame.render_pass_count - frame.render_pass_optimized, frame.render_pass_optimized,
             frame.clear_pass_count - frame.clear_pass_optimized, frame.clear_pass_optimized));
+        Logger::info(std::format(
+            "[dynamic-buffer-recycle] #{} trimmed={} bytes={} fresh-after-trim={}",
+            madeira_stats_frame,
+            dxmt::g_trim_total_n.load(std::memory_order_relaxed),
+            dxmt::g_trim_total_bytes.load(std::memory_order_relaxed),
+            dxmt::g_trim_regret.load(std::memory_order_relaxed)));
+
       }
     }
     {
