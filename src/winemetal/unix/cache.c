@@ -251,9 +251,22 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 
 @end
 
+/* A/B cache opt-out also covers native callers and custom Metal cache paths.
+ * Test it before resolving paths, opening SQLite or touching any cache file.
+ * DXMT's PE shader cache already honours the same switch. */
+static bool
+persistent_shader_cache_disabled(void) {
+  const char *value = getenv("DXMT_SHADER_CACHE");
+  return value && !strcmp(value, "0");
+}
+
 int
 _CacheReader_alloc_init(void *obj) {
   struct unixcall_cache_alloc_init *params = obj;
+  if (persistent_shader_cache_disabled()) {
+    params->ret_cache = 0;
+    return 0;
+  }
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   params->ret_cache = (obj_handle_t)[[CacheReader alloc] initWithPath:path version:params->version];
   [path release];
@@ -274,6 +287,10 @@ _CacheReader_get(void *obj) {
 int
 _CacheWriter_alloc_init(void *obj) {
   struct unixcall_cache_alloc_init *params = obj;
+  if (persistent_shader_cache_disabled()) {
+    params->ret_cache = 0;
+    return 0;
+  }
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   params->ret_cache = (obj_handle_t)[[CacheWriter alloc] initWithPath:path version:params->version];
   [path release];
@@ -299,6 +316,10 @@ extern NSString* MTLGetShaderCachePath();
 int
 _WMTSetMetalShaderCachePath(void *obj) {
   struct unixcall_setmetalcachepath *params = obj;
+  if (persistent_shader_cache_disabled()) {
+    params->ret_success = 0;
+    return 0;
+  }
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   NSString *resolved_path = resolve_cache_dir(path, false);
 #if TARGET_OS_IPHONE
