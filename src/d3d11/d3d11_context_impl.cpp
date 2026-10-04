@@ -4128,7 +4128,7 @@ public:
       // The ring supplies a fresh suballocation; its existing GPU/command-list
       // fences retain the backing. Remote handles never expose cpu_address.
       if (direct_uploads && cpu_address) {
-        copyTextureUpload(static_cast<char *>(cpu_address) + offset, pSrcData,
+        staging_buffer.updateTextureContents(offset, pSrcData,
                           cmd.EffectiveRows, cmd.DstSize.depth,
                           cmd.EffectiveBytesPerRow, SrcRowPitch, SrcDepthPitch,
                           cmd.EffectiveBytesPerRow, bytes_per_depth_slice);

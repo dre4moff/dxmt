@@ -8,8 +8,7 @@
 namespace dxmt {
 
 constexpr size_t kResourceInitializerCpuCommandHeapSize = 0x100000; // 1MB
-constexpr size_t kResourceInitializerGpuUploadHeapSize =
-    kCompactTextureStaging ? kTextureUploadBlockSize : 0x2000000;
+constexpr size_t kResourceInitializerGpuUploadHeapSize = 0x2000000; // 32MB
 constexpr size_t kResourceInitializerGpuUploadHeapAlignment = 256;
 constexpr size_t kResourceInitializerChunks = 2;
 
@@ -53,7 +52,6 @@ public:
 
 private:
   uint64_t flushInternal();
-  uint64_t finishUploadBatch();
 
   struct ClearRenderPassInfo {
     WMTRenderPassInfo info;
@@ -120,9 +118,6 @@ private:
 
   uint64_t current_seq_id_ = 1;
   uint64_t cached_coherent_seq_id = 0;
-#if defined(DXMT_IOS) && !defined(DXMT_MADEIRA) && !defined(__i386__)
-  size_t pending_upload_bytes_ = 0;
-#endif
   WMT::Device device_;
   bool supports_bc_ = false;
   bool direct_uploads_ = false;
@@ -137,8 +132,7 @@ private:
   size_t cpu_command_heap_size;
   size_t cpu_command_heap_offset;
 
-  RingBumpState<StagingBufferBlockAllocator, kResourceInitializerGpuUploadHeapSize,
-                dxmt::mutex, kCompactTextureStaging> gpu_command_heap_allocator;
+  RingBumpState<StagingBufferBlockAllocator, kResourceInitializerGpuUploadHeapSize> gpu_command_heap_allocator;
 
   wmtcmd_blit_nop blit_cmd_head;
   wmtcmd_base *blit_cmd_tail;

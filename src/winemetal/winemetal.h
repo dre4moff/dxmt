@@ -1859,6 +1859,12 @@ WINEMETAL_API obj_handle_t MTLDevice_newEvent(obj_handle_t device);
 WINEMETAL_API void
 MTLBuffer_updateContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data, uint64_t length);
 
+// Appended Unix-call slot 151. Existing dispatch indices are unchanged.
+WINEMETAL_API void
+MTLBuffer_updateTextureContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data,
+                               uint64_t rows, uint64_t depth, uint64_t dst_row, uint64_t src_row,
+                               uint64_t src_image, uint64_t valid_row, uint64_t valid_image);
+
 WINEMETAL_API obj_handle_t SharedEventListener_create();
 
 WINEMETAL_API void SharedEventListener_start(obj_handle_t shared_event_listener);

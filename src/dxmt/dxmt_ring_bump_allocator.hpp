@@ -30,16 +30,6 @@ constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
 constexpr size_t kStagingBlockSizeForDeferredContext = 0x200000; // 2MB
 constexpr size_t kStagingBlockLifetime = 300;
 
-// Only the iOS 64-bit D3D11 upload rings use smaller blocks. Argument/private
-// rings and the native D3D9 frontend retain their established allocation policy.
-#if defined(DXMT_IOS) && !defined(DXMT_MADEIRA) && !defined(__i386__)
-constexpr bool kCompactTextureStaging = true;
-constexpr size_t kTextureUploadBlockSize = 0x800000; // 8MB
-#else
-constexpr bool kCompactTextureStaging = false;
-constexpr size_t kTextureUploadBlockSize = kStagingBlockSize;
-#endif
-
 // DXMT_RING_OVERSIZE_REUSE is a Madeira switch (util_madeira_switch.hpp): on
 // by default only in the i386 build. Every 64-bit build keeps the upstream
 // block lifetime unless it is set.
@@ -54,8 +44,7 @@ inline bool ringOversizeReuseEnabled() {
   return enabled;
 }
 
-template <typename Allocator, size_t BlockSize = kStagingBlockSize, class mutex = dxmt::mutex,
-          bool InclusiveCompletion = false> class RingBumpState {
+template <typename Allocator, size_t BlockSize = kStagingBlockSize, class mutex = dxmt::mutex> class RingBumpState {
 
 public:
 
@@ -328,9 +317,9 @@ public:
   };
 };
 
-template <typename Allocator, size_t BlockSize, class mutex, bool InclusiveCompletion>
+template <typename Allocator, size_t BlockSize, class mutex>
 std::pair<typename Allocator::Block &, uint64_t>
-RingBumpState<Allocator, BlockSize, mutex, InclusiveCompletion>::allocate(
+RingBumpState<Allocator, BlockSize, mutex>::allocate(
     uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment
 ) {
   std::lock_guard<mutex> lock(mutex_);
@@ -351,9 +340,9 @@ RingBumpState<Allocator, BlockSize, mutex, InclusiveCompletion>::allocate(
   );
 };
 
-template <typename Allocator, size_t BlockSize, class mutex, bool InclusiveCompletion>
+template <typename Allocator, size_t BlockSize, class mutex>
 void
-RingBumpState<Allocator, BlockSize, mutex, InclusiveCompletion>::free_blocks(uint64_t coherent_id) {
+RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
   std::lock_guard<mutex> lock(mutex_);
   while (!fifo.empty()) {
     auto &front = fifo.front();
@@ -373,24 +362,15 @@ RingBumpState<Allocator, BlockSize, mutex, InclusiveCompletion>::free_blocks(uin
   }
 };
 
-template <typename Allocator, size_t BlockSize, class mutex, bool InclusiveCompletion>
-RingBumpState<Allocator, BlockSize, mutex, InclusiveCompletion>::Allocation &
-RingBumpState<Allocator, BlockSize, mutex, InclusiveCompletion>::allocate_or_reuse_block(
+template <typename Allocator, size_t BlockSize, class mutex>
+RingBumpState<Allocator, BlockSize, mutex>::Allocation &
+RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
     uint64_t seq_id, uint64_t coherent_id, size_t block_size
 ) {
-  // Compact upload rings keep up to two completed medium-size buffers warm;
-  // shrinking the normal block must not turn every 16/32MB streamed mip into
-  // a new allocation. The existing explicit reuse opt-out still wins.
-  static const bool compact_reuse =
-      InclusiveCompletion && env::getEnvVar("DXMT_RING_OVERSIZE_REUSE") != "0";
-  const bool oversize_reuse = ringOversizeReuseEnabled() || compact_reuse;
   while (!fifo.empty()) {
     auto &front = fifo.front();
-    // A published completion watermark includes its sequence. Reuse its last
-    // upload block immediately, but never reset a block in the current batch.
-    if (front.last_used_seq_id < coherent_id ||
-        (InclusiveCompletion && front.last_used_seq_id == coherent_id && seq_id > coherent_id)) {
-      if (oversize_reuse && front.total_size < block_size) {
+    if (front.last_used_seq_id < coherent_id) {
+      if (ringOversizeReuseEnabled() && front.total_size < block_size) {
         // A completed small block must not strand usable blocks behind it.
         // No pointer into it remains in flight at this coherent sequence.
         if (front.reusable_oversize) --reusable_oversize_blocks_;
@@ -417,9 +397,8 @@ RingBumpState<Allocator, BlockSize, mutex, InclusiveCompletion>::allocate_or_reu
   // Repeated image uploads just above the normal block size otherwise create
   // and destroy a Metal buffer every frame. Retain at most two modest oversize
   // blocks per ring, with the same completion checks and expiry as normal ones.
-  const size_t oversize_limit = InclusiveCompletion ? 32u * 1024u * 1024u : 16u * 1024u * 1024u;
-  const bool reusable_oversize = oversize_reuse && block_size > BlockSize &&
-      block_size <= oversize_limit && reusable_oversize_blocks_ < 2;
+  const bool reusable_oversize = ringOversizeReuseEnabled() && block_size > BlockSize &&
+      block_size <= 16u * 1024u * 1024u && reusable_oversize_blocks_ < 2;
   if (reusable_oversize) ++reusable_oversize_blocks_;
   fifo.push({
       .allocated_size = 0,

@@ -198,8 +198,7 @@ private:
     return encoder_seq++;
   }
 
-  RingBumpState<StagingBufferBlockAllocator, kTextureUploadBlockSize,
-                dxmt::mutex, kCompactTextureStaging> staging_allocator;
+  RingBumpState<StagingBufferBlockAllocator> staging_allocator;
   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator;
   RingBumpState<StagingBufferBlockAllocator, kCommandChunkGPUHeapSize> argbuf_allocator;
   RingBumpState<HostBufferBlockAllocator, kCommandChunkCPUHeapSize, dxmt::null_mutex> cpu_command_allocator;
