@@ -329,6 +329,55 @@ _MTLCopyAllDevices(void *obj) {
  * Documents/madeira-vram-mb.txt overrides the result outright. */
 #include <os/proc.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
+/* The process limit above can be larger than the device's RAM: an iPad with
+ * 7644 MB of RAM measured 8192 MB, so nothing here ever saw a shortage and God
+ * of War sat at an 8175 MB footprint with 4.4 GB compressed, drawing black
+ * frames. Budgets therefore plan with min(limit, hw.memsize - what iOS keeps
+ * for itself). madeira.cfg ram-reserve-mb = that reserve (default 1536; 0 =
+ * plan with the limit alone). On a 12 GB phone the cap is above the limit and
+ * nothing changes; nor on a 6 GB iPhone 13 Pro (5666 MB of RAM, a 4096 MB
+ * limit: 5666 - 1536 = 4130). */
+static uint64_t madeira_ram_cap(void) {
+  static uint64_t cap = 1;   /* 1 = not computed yet */
+  uint64_t c = __atomic_load_n(&cap, __ATOMIC_ACQUIRE);
+  if (c == 1) {
+    /* Computed into a local and published once: a concurrent caller never
+     * sees a half-made 0 ("no cap"). Two first callers may both compute it. */
+    uint64_t mem = 0; size_t len = sizeof mem;
+    long long reserve = madeira_cfg_int("ram-reserve-mb", 1536); /* RAM left to iOS, MB; 0 = limit only */
+    c = 0;
+    if (reserve > 0 && !sysctlbyname("hw.memsize", &mem, &len, NULL, 0) && mem > ((uint64_t)reserve << 20))
+      c = mem - ((uint64_t)reserve << 20);
+    fprintf(stderr, "[wmt] RAM %llu MB, iOS reserve %lld MB -> memory cap %llu MB (madeira.cfg ram-reserve-mb; 0 = off)\n",
+            (unsigned long long)(mem >> 20), reserve, (unsigned long long)(c >> 20));
+    __atomic_store_n(&cap, c, __ATOMIC_RELEASE);
+  }
+  return c;
+}
+/* os_proc_available_memory(), lowered so that footprint + the result stays
+ * within the cap. 0 when the limit is unknown. */
+static uint64_t madeira_avail_memory(uint64_t foot) {
+  uint64_t avail = (uint64_t)os_proc_available_memory(), cap = madeira_ram_cap();
+  if (avail && cap && foot + avail > cap) {
+    static int said;
+    if (!said++)
+      fprintf(stderr, "[wmt] process limit %llu MB is above the memory cap %llu MB: "
+                      "the video budget, its trim and the mip clamp use the cap\n",
+              (unsigned long long)((foot + avail) >> 20), (unsigned long long)(cap >> 20));
+    avail = cap > foot ? cap - foot : (1ull << 20);
+  }
+  return avail;
+}
+/* The process limit a budget plans with: min(limit, cap). */
+static uint64_t madeira_mem_limit(uint64_t foot) {
+  uint64_t limit = (uint64_t)os_proc_available_memory() + foot, cap = madeira_ram_cap();
+  if (cap && limit > cap) {
+    madeira_avail_memory(foot);   /* logs the first lowering */
+    limit = cap;
+  }
+  return limit;
+}
 static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended);
 /* ml1075: DYNAMIC BUDGET. The number above is a one-off: the game read it once
  * and then grew its heap through a cutscene until jetsam (ph-rdr42: guest heap
@@ -350,7 +399,7 @@ static uint64_t madeira_ml1075_dynamic_budget(uint64_t base) {
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
     uint64_t foot = 0, limit, high, budget = base;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS) foot = vmi.phys_footprint;
-    limit = (uint64_t)os_proc_available_memory() + foot;
+    limit = madeira_mem_limit(foot);
     /* ml1103: madeira.cfg vram-trim-mb = distance below the kill line where the
      * trim starts (default 1536, the ml1075 value); 0 = never trim. ph-rdr56:
      * raising vram-mb to 3072 doubled the snow-scene frame rate, but in the city
@@ -383,7 +432,7 @@ static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended) {
   if (!budget) {
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS) foot = vmi.phys_footprint;
-    limit = (uint64_t)os_proc_available_memory() + foot;
+    limit = madeira_mem_limit(foot);
     const uint64_t guest_ram = 4096ull << 20;      /* what ml992 lets the guest see */
     const uint64_t overhead  = 2560ull << 20;      /* JIT pool + FEX + Wine + host, measured */
     budget = limit > guest_ram + overhead ? limit - guest_ram - overhead : 0;
@@ -487,6 +536,50 @@ _MTLCommandQueue_commandBuffer(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* ml1174: GPU busy time for the performance overlay. While the overlay shows
+ * GPU load, every committed command buffer gets a completion handler that adds
+ * the part of its GPUStartTime..GPUEndTime not already covered by an earlier
+ * buffer (the union, as DXMT's [gpu-perf] counts it). Off, nothing is attached.
+ * Command buffers committed through the remote path (wmtr) are not counted. */
+static _Atomic int g_madeira_gpu_meter;
+static os_unfair_lock g_gpu_meter_lock = OS_UNFAIR_LOCK_INIT;
+static double g_gpu_meter_busy_s, g_gpu_meter_last_end;
+static _Atomic uint64_t g_gpu_meter_cmdbufs;
+
+void madeira_gpu_meter_enable(int on) {
+  atomic_store_explicit(&g_madeira_gpu_meter, on ? 1 : 0, memory_order_relaxed);
+}
+
+/* Busy seconds so far and command buffers counted; both only grow. */
+double madeira_gpu_meter_busy_seconds(void) {
+  double v;
+  os_unfair_lock_lock(&g_gpu_meter_lock);
+  v = g_gpu_meter_busy_s;
+  os_unfair_lock_unlock(&g_gpu_meter_lock);
+  return v;
+}
+
+uint64_t madeira_gpu_meter_cmdbufs(void) {
+  return atomic_load_explicit(&g_gpu_meter_cmdbufs, memory_order_relaxed);
+}
+
+static void madeira_gpu_meter_attach(id<MTLCommandBuffer> cmdbuf) {
+  [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+    double start = buffer.GPUStartTime, end = buffer.GPUEndTime;
+    if (start <= 0.0 || end <= start)
+      return;
+    os_unfair_lock_lock(&g_gpu_meter_lock);
+    if (start < g_gpu_meter_last_end)
+      start = g_gpu_meter_last_end;
+    if (end > start)
+      g_gpu_meter_busy_s += end - start;
+    if (end > g_gpu_meter_last_end)
+      g_gpu_meter_last_end = end;
+    os_unfair_lock_unlock(&g_gpu_meter_lock);
+    atomic_fetch_add_explicit(&g_gpu_meter_cmdbufs, 1, memory_order_relaxed);
+  }];
+}
+
 static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
@@ -516,6 +609,8 @@ _MTLCommandBuffer_commit(void *obj) {
       madeira_perf_gpu(buffer.GPUStartTime, buffer.GPUEndTime, buffer.status == MTLCommandBufferStatusError);
     }];
   }
+  if (atomic_load_explicit(&g_madeira_gpu_meter, memory_order_relaxed))
+    madeira_gpu_meter_attach((id<MTLCommandBuffer>)params->handle);
   [(id<MTLCommandBuffer>)params->handle commit];
   return STATUS_SUCCESS;
 }
@@ -586,6 +681,28 @@ _MTLCommandBuffer_encodeSignalEvent(void *obj) {
   }
   [(id<MTLCommandBuffer>)params->handle encodeSignalEvent:(id<MTLSharedEvent>)params->arg0 value:params->arg1];
   return STATUS_SUCCESS;
+}
+
+/* ml1178: no write-combined CPU mappings. DXMT asks for
+ * MTLCPUCacheModeWriteCombined on what the CPU only writes (dynamic buffers
+ * and textures, upload staging). Under FEX's TSO emulation every x86 integer
+ * store is an STLR, and a store-release to a write-combined page waits for the
+ * previous store to reach memory: Metro 2033 Redux's intro converts YUV to RGBA with one
+ * 32-bit mov per pixel into a mapped dynamic texture and ran at 3 FPS (the
+ * JIT loop was LDAPRB x3 + STLR per pixel). Shared memory on Apple GPUs is
+ * coherent, so the default cache mode only costs cache footprint.
+ * env.MADEIRA_WRITE_COMBINED = 1 keeps DXMT's flag. Applied wherever resource
+ * options reach Metal, so a buffer and a texture view over it still agree. */
+static MTLResourceOptions
+madeira_cpu_cache_mode(MTLResourceOptions options) {
+  static int keep = -1;
+  if (keep < 0) {
+    const char *e = getenv("MADEIRA_WRITE_COMBINED");
+    keep = (e && e[0] == '1') ? 1 : 0;
+    dprintf(STDERR_FILENO, "[iOS DXMT] ml1178 write-combined CPU mappings %s (env.MADEIRA_WRITE_COMBINED)\n",
+            keep ? "kept" : "off");
+  }
+  return keep ? options : (options & ~(MTLResourceOptions)MTLResourceCPUCacheModeMask);
 }
 
 static NTSTATUS
@@ -702,10 +819,10 @@ _MTLDevice_newBuffer(void *obj) {
   if (info->memory.ptr) {
     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
                                        length:info->length
-                                      options:(enum MTLResourceOptions)info->options
+                                      options:madeira_cpu_cache_mode((MTLResourceOptions)info->options)
                                   deallocator:NULL];
   } else {
-    buffer = [device newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
+    buffer = [device newBufferWithLength:info->length options:madeira_cpu_cache_mode((MTLResourceOptions)info->options)];
     info->memory.ptr = [buffer storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
   }
   params->ret = (obj_handle_t)buffer;
@@ -853,21 +970,30 @@ static bool query_bc_support(void) {
     return g_bc_supported_cached != 0;
   }
   bool supported = false;
+  int float32_filter = -1;
+  char dev_class[64] = "?";
   @autoreleasepool {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (dev) {
+      snprintf(dev_class, sizeof(dev_class), "%s", object_getClassName(dev));   /* ml1249: MTLDebugDevice = validation on */
       if ([dev respondsToSelector:@selector(supportsBCTextureCompression)])
         supported = [dev supportsBCTextureCompression];
+      if ([dev respondsToSelector:@selector(supports32BitFloatFiltering)])
+        float32_filter = [dev supports32BitFloatFiltering] ? 1 : 0;
       [dev release];
     }
   }
   g_bc_supported_cached = supported ? 1 : 0;
   /* iOS-Madeira 2026-05-18: one-shot log so we can see if A15+ supports BC
    * natively (would skip all the BC decoder work). Fires exactly once
-   * per process — first call to to_metal_pixel_format. */
+   * per process — first call to to_metal_pixel_format.
+   * ml1248: plus 32-bit float filtering, which Apple7/8 iPads have or lack per
+   * GPU -- a linear sampler on R32F/RG32F/RGBA32F without it is undefined. */
   dprintf(STDERR_FILENO,
-          "[iOS DXMT] supportsBCTextureCompression = %s\n",
-          supported ? "YES" : "NO");
+          "[iOS DXMT] supportsBCTextureCompression = %s supports32BitFloatFiltering = %s MTL_DEBUG_LAYER=%s device class %s\n",
+          supported ? "YES" : "NO",
+          float32_filter < 0 ? "?" : (float32_filter ? "YES" : "NO"),
+          getenv("MTL_DEBUG_LAYER") ? getenv("MTL_DEBUG_LAYER") : "unset", dev_class);
   return supported;
 }
 
@@ -976,6 +1102,19 @@ static bool texture_upload_pitch_ok(id<MTLTexture> tex, size_t width, size_t byt
   return bytes_per_row >= width * bpp;
 }
 
+/* madeira_d3d12 copies ONE plane of a combined depth-stencil texture from a
+ * buffer and names it in reserved[0] (1 = depth, 2 = stencil, the
+ * MTLBlitOption values); Metal leaves a buffer->texture copy into such a
+ * texture without the option undefined. Other producers may leave reserved[0]
+ * uninitialised, so it counts only for a combined depth-stencil destination. */
+static MTLBlitOption b2t_plane_option(id<MTLTexture> dst, uint16_t value) {
+  if (value != MTLBlitOptionDepthFromDepthStencil && value != MTLBlitOptionStencilFromDepthStencil)
+    return MTLBlitOptionNone;
+  if ([dst pixelFormat] != MTLPixelFormatDepth32Float_Stencil8)
+    return MTLBlitOptionNone;
+  return (MTLBlitOption)value;
+}
+
 void
 fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info) {
   desc.textureType = (MTLTextureType)info->type;
@@ -987,7 +1126,7 @@ fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info)
   desc.mipmapLevelCount = info->mipmap_level_count;
   desc.sampleCount = info->sample_count;
   desc.usage = (MTLTextureUsage)info->usage;
-  desc.resourceOptions = (MTLResourceOptions)info->options;
+  desc.resourceOptions = madeira_cpu_cache_mode((MTLResourceOptions)info->options);
 };
 
 void
@@ -1988,8 +2127,11 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     case WMTBlitCommandCopyFromBufferToTexture: {
       struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
       id<MTLTexture> dst = (id<MTLTexture>)body->dst;
-      /* iOS-Madeira: skip BC-pitch uploads to remapped RGBA8 textures. */
-      if (!texture_upload_pitch_ok(dst, body->size.width, body->bytes_per_row))
+      MTLBlitOption plane = b2t_plane_option(dst, body->reserved[0]);
+      /* iOS-Madeira: skip BC-pitch uploads to remapped RGBA8 textures. Not for
+       * a plane copy: one plane is 4 or 1 bytes per pixel, not the combined
+       * format's (as the texture->buffer case below, ml1102). */
+      if (!plane && !texture_upload_pitch_ok(dst, body->size.width, body->bytes_per_row))
         break;
       wmt_stale_check(body->src, "blit copy src"); wmt_stale_check(body->dst, "blit copy dst");
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
@@ -2000,7 +2142,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
                     toTexture:dst
              destinationSlice:body->slice
              destinationLevel:body->level
-            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)];
+            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                      options:plane];
       break;
     }
     case WMTBlitCommandCopyFromTextureToBuffer: {
@@ -2551,6 +2694,10 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawMeshThreadgroups: {
       struct wmtcmd_render_draw_meshthreadgroups *body = (struct wmtcmd_render_draw_meshthreadgroups *)next;
+      /* DXIL tessellation draws carry the object threadgroup memory the
+       * converter's draw helpers set (see struct wmtcmd_render_draw_meshthreadgroups). */
+      if (body->reserved[1] == 0x7e55 && body->reserved[0])
+        [encoder setObjectThreadgroupMemoryLength:body->reserved[0] atIndex:0];
       [encoder drawMeshThreadgroups:MTLSizeMake(
                                         body->threadgroup_per_grid.width, body->threadgroup_per_grid.height,
                                         body->threadgroup_per_grid.depth
@@ -2918,8 +3065,15 @@ uint64_t madeira_get_present_count(void) {
  *   3 = LOCKED30 (2026-09-15, device feedback): same mechanism as mode 1,
  *       afterMinimumDuration(1/30) — exact 30. A real cap on THIS present
  *       path, not merely a CADisplayLink hint: the drawable is genuinely
- *       held until the next 1/30s boundary, same as mode 1 is at 1/60s. */
+ *       held until the next 1/30s boundary, same as mode 1 is at 1/60s.
+ *   4 = LOCKED40: the same at 1/40. 25 ms is three refreshes of a 120Hz
+ *       panel but rounds to 33 ms at 60Hz, so the app offers it only on a
+ *       120Hz panel and holds the panel at its maximum while it runs. */
 static volatile int g_madeira_vsync_mode = 1;
+
+/* The app offers the 40 FPS cap only when this is linked (IOSDisplayShim.m
+ * has a weak fallback returning 0 for a DXMT without mode 4). */
+int madeira_dxmt_has_40_cap(void) { return 1; }
 
 /* ml1050: what the PANEL can do, published from Swift (only UIKit knows it).
  * Nothing branches on these -- they are printed by the [frame] line, because
@@ -2939,7 +3093,7 @@ void madeira_set_display_max_fps(int panel_hz, int intent_hz) {
 void madeira_set_vsync_locked(int mode) {
   g_madeira_vsync_mode = mode;
   ios_frame_note_display(g_madeira_panel_hz, g_madeira_intent_hz, mode);
-  dprintf(STDERR_FILENO, "[iOS DXMT] vsync_mode=%d (1=locked60 0=max 2=raw 3=locked30)\n", mode);
+  dprintf(STDERR_FILENO, "[iOS DXMT] vsync_mode=%d (1=locked60 0=max 2=raw 3=locked30 4=locked40)\n", mode);
 }
 int madeira_get_vsync_locked(void) { return g_madeira_vsync_mode; }
 
@@ -3004,6 +3158,305 @@ static unsigned long long madeira_present_limit_to(double period_s) {
   return (unsigned long long)slept_abs * tb.numer / tb.denom;
 }
 
+/* Experimental frame generation (MADEIRA_FRAMEGEN=1, off by default). Every
+ * frame -- D3D11 through DXMT, and D3D12, whose runtime presents through this
+ * same call -- reaches _MTLCommandBuffer_presentDrawable. With the switch on it:
+ *   1. copies the drawable into a history texture (the layer is made
+ *      framebufferOnly = NO so the drawable can be read),
+ *   2. estimates motion between the previous and this frame on the GPU (block
+ *      matching on 1/8-size luma; the game gives no motion vectors),
+ *   3. runs MetalFX's frame interpolator (MTLFXFrameInterpolator, iOS 26) on
+ *      the two frames, that motion field and a flat depth,
+ *   4. presents the generated frame at once and the real one half a frame
+ *      later (presentDrawable:atTime:).
+ * The panel shows twice the game's frame rate, at the cost of half a frame of
+ * latency and the interpolator's GPU time. Without depth, a UI mask or the
+ * camera, edges and the HUD show artifacts. MADEIRA_FRAMEGEN_RADIUS (search
+ * radius in 1/8-size pixels, default 6), MADEIRA_FRAMEGEN_MVSCALE
+ * (motionVectorScale, default 1) and MADEIRA_FRAMEGEN_MVSIGN (-1 flips the
+ * vectors) tune it. The FPS caps do not apply while it is on (RAW keeps its
+ * own path): the game's own rate is what gets doubled. */
+static int g_fg_on = -1;
+static int madeira_fg_enabled(void) {
+  if (g_fg_on < 0) {
+    const char *e = getenv("MADEIRA_FRAMEGEN");
+    g_fg_on = (e && *e && *e != '0') ? 1 : 0;
+    if (g_fg_on)
+      dprintf(STDERR_FILENO, "[framegen] ON (MADEIRA_FRAMEGEN): MetalFX frame interpolation between game frames\n");
+  }
+  return g_fg_on;
+}
+static float madeira_fg_envf(const char *name, float dflt) {
+  const char *e = getenv(name);
+  return (e && *e) ? (float)atof(e) : dflt;
+}
+
+static const char *g_fg_msl =
+  "#include <metal_stdlib>\n"
+  "using namespace metal;\n"
+  "kernel void fg_luma(texture2d<float, access::sample> src [[texture(0)]],\n"
+  "                    texture2d<float, access::write> dst [[texture(1)]],\n"
+  "                    uint2 gid [[thread_position_in_grid]]) {\n"
+  "  if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+  "  constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+  "  float2 inv = 1.0 / float2(dst.get_width(), dst.get_height());\n"
+  "  float2 uv = (float2(gid) + 0.5) * inv, q = inv * 0.25;\n"
+  "  float3 c = src.sample(s, uv + float2(-q.x, -q.y)).rgb + src.sample(s, uv + float2(q.x, -q.y)).rgb\n"
+  "           + src.sample(s, uv + float2(-q.x, q.y)).rgb + src.sample(s, uv + float2(q.x, q.y)).rgb;\n"
+  "  dst.write(float4(dot(c * 0.25, float3(0.299, 0.587, 0.114)), 0, 0, 1), gid);\n"
+  "}\n"
+  "kernel void fg_flow(texture2d<float, access::read> cur [[texture(0)]],\n"
+  "                    texture2d<float, access::read> prev [[texture(1)]],\n"
+  "                    texture2d<float, access::write> flow [[texture(2)]],\n"
+  "                    constant int &radius [[buffer(0)]],\n"
+  "                    uint2 gid [[thread_position_in_grid]]) {\n"
+  "  int W = cur.get_width(), H = cur.get_height();\n"
+  "  if ((int)gid.x >= W || (int)gid.y >= H) return;\n"
+  "  int2 p = int2(gid), hi = int2(W - 1, H - 1);\n"
+  "  float best = 1e9; int2 bd = int2(0);\n"
+  "  for (int dy = -radius; dy <= radius; dy++)\n"
+  "    for (int dx = -radius; dx <= radius; dx++) {\n"
+  "      float sad = 0.002 * float(abs(dx) + abs(dy));\n"
+  "      for (int py = -2; py <= 2; py++)\n"
+  "        for (int px = -2; px <= 2; px++) {\n"
+  "          int2 a = clamp(p + int2(px, py), int2(0), hi);\n"
+  "          int2 b = clamp(p + int2(px + dx, py + dy), int2(0), hi);\n"
+  "          sad += fabs(cur.read(uint2(a)).r - prev.read(uint2(b)).r);\n"
+  "        }\n"
+  "      if (sad < best) { best = sad; bd = int2(dx, dy); }\n"
+  "    }\n"
+  "  flow.write(float4(float2(bd), 0, 0), gid);\n"
+  "}\n"
+  "kernel void fg_motion(texture2d<float, access::sample> flow [[texture(0)]],\n"
+  "                      texture2d<float, access::write> motion [[texture(1)]],\n"
+  "                      constant float &scale [[buffer(0)]],\n"
+  "                      uint2 gid [[thread_position_in_grid]]) {\n"
+  "  if (gid.x >= motion.get_width() || gid.y >= motion.get_height()) return;\n"
+  "  constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+  "  float2 uv = (float2(gid) + 0.5) / float2(motion.get_width(), motion.get_height());\n"
+  "  motion.write(float4(flow.sample(s, uv).rg * scale, 0, 0), gid);\n"
+  "}\n";
+
+static struct {
+  NSUInteger w, h;
+  MTLPixelFormat fmt;
+  id interp;                                 /* id<MTLFXFrameInterpolator> */
+  id<MTLTexture> hist[2], luma[2], flow, motion, depth, out;
+  id<MTLComputePipelineState> k_luma, k_flow, k_motion;
+  int cur, have_prev, dead;
+  uint64_t last_abs;
+  double dt;
+  unsigned long long frames, generated, no_drawable;
+} g_fg;
+
+static void madeira_fg_release(void) {
+  int i;
+  for (i = 0; i < 2; i++) {
+    [g_fg.hist[i] release]; g_fg.hist[i] = nil;
+    [g_fg.luma[i] release]; g_fg.luma[i] = nil;
+  }
+  [g_fg.flow release]; [g_fg.motion release]; [g_fg.depth release]; [g_fg.out release];
+  g_fg.flow = g_fg.motion = g_fg.depth = g_fg.out = nil;
+  [g_fg.interp release]; g_fg.interp = nil;
+  g_fg.have_prev = 0;
+}
+
+static id<MTLTexture> madeira_fg_tex(id<MTLDevice> dev, MTLPixelFormat f, NSUInteger w, NSUInteger h,
+                                     MTLTextureUsage u) {
+  MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
+  d.usage = u;
+  d.storageMode = MTLStorageModePrivate;
+  return [dev newTextureWithDescriptor:d];
+}
+
+/* Pipelines once, textures and the interpolator per drawable size/format. */
+static int madeira_fg_setup(id<MTLDevice> dev, id<MTLTexture> src) {
+  if (g_fg.dead) return 0;
+  if (!g_fg.k_luma) {
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:g_fg_msl] options:nil error:&err];
+    if (!lib) {
+      dprintf(STDERR_FILENO, "[framegen] shader compile failed: %s -- off\n", err ? err.description.UTF8String : "?");
+      g_fg.dead = 1;
+      return 0;
+    }
+    id<MTLFunction> f1 = [lib newFunctionWithName:@"fg_luma"], f2 = [lib newFunctionWithName:@"fg_flow"],
+                    f3 = [lib newFunctionWithName:@"fg_motion"];
+    g_fg.k_luma = [dev newComputePipelineStateWithFunction:f1 error:&err];
+    g_fg.k_flow = [dev newComputePipelineStateWithFunction:f2 error:&err];
+    g_fg.k_motion = [dev newComputePipelineStateWithFunction:f3 error:&err];
+    [f1 release]; [f2 release]; [f3 release]; [lib release];
+    if (!g_fg.k_luma || !g_fg.k_flow || !g_fg.k_motion) {
+      dprintf(STDERR_FILENO, "[framegen] pipeline creation failed -- off\n");
+      g_fg.dead = 1;
+      return 0;
+    }
+  }
+  if (g_fg.interp && g_fg.w == src.width && g_fg.h == src.height && g_fg.fmt == src.pixelFormat) return 1;
+
+  madeira_fg_release();
+  g_fg.w = src.width; g_fg.h = src.height; g_fg.fmt = src.pixelFormat;
+  if (@available(iOS 26.0, macOS 26.0, *)) {
+    if (![MTLFXFrameInterpolatorDescriptor supportsDevice:dev]) {
+      dprintf(STDERR_FILENO, "[framegen] MetalFX frame interpolation is not supported on this GPU -- off\n");
+      g_fg.dead = 1;
+      return 0;
+    }
+    MTLFXFrameInterpolatorDescriptor *desc = [[MTLFXFrameInterpolatorDescriptor alloc] init];
+    desc.colorTextureFormat = g_fg.fmt;
+    desc.outputTextureFormat = g_fg.fmt;
+    desc.depthTextureFormat = MTLPixelFormatDepth32Float;
+    desc.motionTextureFormat = MTLPixelFormatRG16Float;
+    desc.inputWidth = g_fg.w;  desc.inputHeight = g_fg.h;
+    desc.outputWidth = g_fg.w; desc.outputHeight = g_fg.h;
+    id<MTLFXFrameInterpolator> fi = [desc newFrameInterpolatorWithDevice:dev];
+    if (!fi) {
+      desc.uiTextureFormat = g_fg.fmt;   /* in case a UI format is required */
+      fi = [desc newFrameInterpolatorWithDevice:dev];
+    }
+    [desc release];
+    if (!fi) {
+      dprintf(STDERR_FILENO, "[framegen] no interpolator for %lux%lu fmt %lu -- off\n",
+              (unsigned long)g_fg.w, (unsigned long)g_fg.h, (unsigned long)g_fg.fmt);
+      g_fg.dead = 1;
+      return 0;
+    }
+    g_fg.interp = fi;
+    NSUInteger lw = (g_fg.w + 7) / 8, lh = (g_fg.h + 7) / 8;
+    for (int i = 0; i < 2; i++) {
+      g_fg.hist[i] = madeira_fg_tex(dev, g_fg.fmt, g_fg.w, g_fg.h, fi.colorTextureUsage | MTLTextureUsageShaderRead);
+      g_fg.luma[i] = madeira_fg_tex(dev, MTLPixelFormatR16Float, lw, lh, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    }
+    g_fg.flow = madeira_fg_tex(dev, MTLPixelFormatRG16Float, lw, lh, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    g_fg.motion = madeira_fg_tex(dev, MTLPixelFormatRG16Float, g_fg.w, g_fg.h, fi.motionTextureUsage | MTLTextureUsageShaderWrite);
+    g_fg.depth = madeira_fg_tex(dev, MTLPixelFormatDepth32Float, g_fg.w, g_fg.h, fi.depthTextureUsage | MTLTextureUsageRenderTarget);
+    g_fg.out = madeira_fg_tex(dev, g_fg.fmt, g_fg.w, g_fg.h, fi.outputTextureUsage | MTLTextureUsageShaderRead);
+    if (!g_fg.hist[0] || !g_fg.hist[1] || !g_fg.luma[0] || !g_fg.luma[1] || !g_fg.flow || !g_fg.motion ||
+        !g_fg.depth || !g_fg.out) {
+      dprintf(STDERR_FILENO, "[framegen] texture allocation failed -- off\n");
+      madeira_fg_release();
+      g_fg.dead = 1;
+      return 0;
+    }
+    dprintf(STDERR_FILENO, "[framegen] interpolator ready: %lux%lu fmt %lu, motion search on %lux%lu\n",
+            (unsigned long)g_fg.w, (unsigned long)g_fg.h, (unsigned long)g_fg.fmt, (unsigned long)lw, (unsigned long)lh);
+    return 1;
+  }
+  dprintf(STDERR_FILENO, "[framegen] needs iOS 26 -- off\n");
+  g_fg.dead = 1;
+  return 0;
+}
+
+static void madeira_fg_dispatch(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p, NSUInteger w, NSUInteger h) {
+  [enc setComputePipelineState:p];
+  [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+}
+
+/* Returns 1 when it presented (the generated frame, then the real one). */
+static int madeira_fg_present_inner(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable) {
+  static mach_timebase_info_data_t tb;
+  id<MTLTexture> src = drawable.texture;
+  id<MTLDevice> dev = src.device;
+  uint64_t now = mach_absolute_time();
+  int ni, have_prev;
+
+  if (!tb.denom) mach_timebase_info(&tb);
+  if (g_fg.last_abs) {
+    double d = (double)(now - g_fg.last_abs) * tb.numer / tb.denom / 1e9;
+    if (d < 1.0 / 120.0) d = 1.0 / 120.0;
+    if (d > 1.0 / 15.0) { d = 1.0 / 15.0; g_fg.have_prev = 0; }   /* a stall: no stale history */
+    g_fg.dt = g_fg.dt > 0 ? g_fg.dt * 0.8 + d * 0.2 : d;
+  }
+  g_fg.last_abs = now;
+  if (!src || !madeira_fg_setup(dev, src)) return 0;
+
+  ni = g_fg.cur ^ 1;
+  have_prev = g_fg.have_prev;
+  {
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:src toTexture:g_fg.hist[ni]];
+    [blit endEncoding];
+  }
+  {
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setTexture:g_fg.hist[ni] atIndex:0];
+    [enc setTexture:g_fg.luma[ni] atIndex:1];
+    madeira_fg_dispatch(enc, g_fg.k_luma, g_fg.luma[ni].width, g_fg.luma[ni].height);
+    if (have_prev) {
+      int radius = (int)madeira_fg_envf("MADEIRA_FRAMEGEN_RADIUS", 6.0f);
+      float scale = 8.0f * madeira_fg_envf("MADEIRA_FRAMEGEN_MVSIGN", 1.0f);
+      if (radius < 1) radius = 1;
+      if (radius > 16) radius = 16;
+      [enc setTexture:g_fg.luma[ni] atIndex:0];
+      [enc setTexture:g_fg.luma[g_fg.cur] atIndex:1];
+      [enc setTexture:g_fg.flow atIndex:2];
+      [enc setBytes:&radius length:sizeof radius atIndex:0];
+      madeira_fg_dispatch(enc, g_fg.k_flow, g_fg.flow.width, g_fg.flow.height);
+      [enc setTexture:g_fg.flow atIndex:0];
+      [enc setTexture:g_fg.motion atIndex:1];
+      [enc setBytes:&scale length:sizeof scale atIndex:0];
+      madeira_fg_dispatch(enc, g_fg.k_motion, g_fg.w, g_fg.h);
+    }
+    [enc endEncoding];
+  }
+  if (!have_prev) {   /* first frame (or after a stall): flat depth once, no generated frame */
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture = g_fg.depth;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.depthAttachment.clearDepth = 0.5;
+    [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+    g_fg.cur = ni;
+    g_fg.have_prev = 1;
+    return 0;
+  }
+
+  id<CAMetalDrawable> extra = nil;
+  if (@available(iOS 26.0, macOS 26.0, *)) {
+    id<MTLFXFrameInterpolator> fi = (id<MTLFXFrameInterpolator>)g_fg.interp;
+    float mvs = madeira_fg_envf("MADEIRA_FRAMEGEN_MVSCALE", 1.0f);
+    fi.colorTexture = g_fg.hist[ni];
+    fi.prevColorTexture = g_fg.hist[g_fg.cur];
+    fi.depthTexture = g_fg.depth;
+    fi.motionTexture = g_fg.motion;
+    fi.outputTexture = g_fg.out;
+    fi.motionVectorScaleX = mvs;
+    fi.motionVectorScaleY = mvs;
+    fi.deltaTime = (float)g_fg.dt;
+    fi.nearPlane = 0.1f;
+    fi.farPlane = 1000.0f;
+    fi.fieldOfView = 60.0f;
+    fi.aspectRatio = (float)g_fg.w / (float)g_fg.h;
+    fi.jitterOffsetX = 0; fi.jitterOffsetY = 0;
+    fi.shouldResetHistory = g_fg.generated == 0;
+    [fi encodeToCommandBuffer:cb];
+    extra = [(CAMetalLayer *)drawable.layer nextDrawable];
+  }
+  g_fg.cur = ni;
+  g_fg.frames++;
+  if (!extra || extra.texture.width != g_fg.w || extra.texture.height != g_fg.h) {
+    g_fg.no_drawable++;
+    return 0;   /* the caller presents the real frame as usual */
+  }
+  {
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:g_fg.out toTexture:extra.texture];
+    [blit endEncoding];
+  }
+  [cb presentDrawable:extra];
+  [cb presentDrawable:drawable atTime:CACurrentMediaTime() + g_fg.dt * 0.5];
+  g_fg.generated++;
+  if (g_fg.generated == 1 || (g_fg.generated % 600) == 0)
+    dprintf(STDERR_FILENO, "[framegen] %llu generated / %llu frames (no drawable %llu), game frame %.1f ms\n",
+            g_fg.generated, g_fg.frames, g_fg.no_drawable, g_fg.dt * 1000.0);
+  return 1;
+}
+static int madeira_fg_present(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable) {
+  int r;
+  @autoreleasepool { r = madeira_fg_present_inner(cb, drawable); }
+  return r;
+}
+
 static NTSTATUS
 _MTLCommandBuffer_presentDrawable(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
@@ -3018,12 +3471,18 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
   /* ml1050: this call IS the frame boundary on the encode thread. */
   if (madeira_frame_hooks_on())
     ios_frame_encode_present(0);
-  if ((mode == 1 || mode == 3) && madeira_present_limiter_enabled()) {
+  /* Frame generation presents both frames itself (madeira_fg_present). */
+  if (mode != 2 && madeira_fg_enabled() &&
+      madeira_fg_present((id<MTLCommandBuffer>)params->handle, (id<CAMetalDrawable>)params->arg)) {
+    madeira_log_present_cadence("presentFramegen", 0.0);
+    return STATUS_SUCCESS;
+  }
+  if ((mode == 1 || mode == 3 || mode == 4) && madeira_present_limiter_enabled()) {
     /* Opt-in precise pacing: hold the producer to the deadline and then ask
      * for the next vblank with no minimum duration, so the cap is the
      * limiter's and the only quantisation left is the panel's own. */
-    ios_frame_limiter(madeira_present_limit_to(mode == 3 ? (1.0 / 30.0) : (1.0 / 60.0)));
-    madeira_log_present_cadence(mode == 3 ? "presentLimited30" : "presentLimited60", 0.0);
+    ios_frame_limiter(madeira_present_limit_to(mode == 3 ? (1.0 / 30.0) : mode == 4 ? (1.0 / 40.0) : (1.0 / 60.0)));
+    madeira_log_present_cadence(mode == 3 ? "presentLimited30" : mode == 4 ? "presentLimited40" : "presentLimited60", 0.0);
     [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
   } else if (mode == 1) {
     madeira_log_present_cadence("presentDrawable60", 0.0);
@@ -3037,6 +3496,12 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
     madeira_log_present_cadence("presentDrawable30", 0.0);
     [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg
                                      afterMinimumDuration:(1.0 / 30.0)];
+  } else if (mode == 4) {
+    /* The same at 40: the drawable pool gives back-pressure, so the game
+     * itself runs at the cap. */
+    madeira_log_present_cadence("presentDrawable40", 0.0);
+    [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg
+                                     afterMinimumDuration:(1.0 / 40.0)];
   } else if (mode == 2) {
     /* Frame-skip gating lives in _MetalLayer_nextDrawable (nil return);
      * only real, ≥18ms-spaced frames reach here. */
@@ -3487,7 +3952,7 @@ _MetalLayer_setProps(void *obj) {
   execute_on_main(^{
     layer.device = (id<MTLDevice>)props->device;
     layer.opaque = props->opaque;
-    layer.framebufferOnly = props->framebuffer_only;
+    layer.framebufferOnly = madeira_fg_enabled() ? NO : props->framebuffer_only;   /* frame generation reads the drawable */
     layer.contentsScale = props->contents_scale;
 #if !TARGET_OS_IOS
     layer.displaySyncEnabled = props->display_sync_enabled;
@@ -5191,11 +5656,18 @@ _MTLDevice_newSharedTexture(void *obj) {
     MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
     fill_texture_descriptor(desc, info);
     id<MTLTexture> ret = [device newSharedTextureWithDescriptor:desc];
-    MTLSharedTextureHandle *handle = [ret newSharedTextureHandle];
     params->ret = (obj_handle_t)ret;
     info->gpu_resource_id = [ret gpuResourceID]._impl;
+#if TARGET_OS_IOS
+    /* An iOS app cannot bootstrap-register the port, so the caller could only
+     * fail the creation (Crysis Remastered then crashed on the views it never
+     * got). Without a port DXMT keeps the texture unshared (ml866). */
+    info->mach_port = 0;
+#else
+    MTLSharedTextureHandle *handle = [ret newSharedTextureHandle];
     info->mach_port = [handle createMachPort]; // implicitly add ref to underlying IOSurface
     [handle release];
+#endif
     [desc release];
   }
 
@@ -6186,20 +6658,22 @@ static NTSTATUS _madeira_ctl(void *args) {
     break;
   }
   case 7: {   /* ml2000: memory headroom for DXMT's automatic mip clamp.
-               * len = os_proc_available_memory() bytes, ptr = phys_footprint
+               * len = os_proc_available_memory() bytes (lowered to the memory
+               * cap, see madeira_ram_cap), ptr = phys_footprint
                * bytes (0 when task_info fails), ret = 1. ret stays 0 when the
                * limit is unknown (0 from os_proc_available_memory) and in
                * remote mode, where textures live on the other machine. No
                * pointer is read or written, which is why the wow64 entry may
                * forward this op unchanged. */
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    uint64_t avail;
+    uint64_t avail, foot;
     if (wmtr_enabled()) break;
-    avail = (uint64_t)os_proc_available_memory();
+    foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS
+               ? (uint64_t)vmi.phys_footprint : 0;
+    avail = madeira_avail_memory(foot);
     if (!avail) break;
     a->len = avail;
-    a->ptr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS
-                 ? (uint64_t)vmi.phys_footprint : 0;
+    a->ptr = foot;
     a->ret = 1;
     break;
   }
@@ -6353,7 +6827,7 @@ _MTLDevice_heapBufferSizeAndAlign(void *obj) {
   if (wmtr_enabled()) return STATUS_SUCCESS;
   {
     MTLSizeAndAlign sa = [(id<MTLDevice>)params->device heapBufferSizeAndAlignWithLength:params->length
-                                                                                  options:(MTLResourceOptions)params->options];
+                                                                                  options:madeira_cpu_cache_mode((MTLResourceOptions)params->options)];
     params->ret_size = sa.size; params->ret_align = sa.align;
   }
   return STATUS_SUCCESS;
@@ -6366,7 +6840,7 @@ _MTLHeap_newBufferAtOffset(void *obj) {
   if (wmtr_enabled()) return STATUS_SUCCESS;
   {
     id<MTLBuffer> b = [(id<MTLHeap>)params->heap newBufferWithLength:info->length
-                                                             options:(MTLResourceOptions)info->options
+                                                             options:madeira_cpu_cache_mode((MTLResourceOptions)info->options)
                                                               offset:params->offset];
     params->ret = (obj_handle_t)b;
     if (wmt_stale_probe_on()) wmt_freed_set((uintptr_t)b, 0);   /* ml1156 */
@@ -6472,6 +6946,72 @@ _MTLDevice_newGeometryEmulationPipelineState(void *obj) {
     d.alphaToCoverageEnabled = i->alpha_to_coverage_enabled;
     d.rasterizationEnabled = i->rasterization_enabled;
     d.rasterSampleCount = i->raster_sample_count ? i->raster_sample_count : 1;
+
+    if (g->tessellation) {
+      /* DXIL tessellation, built exactly as the converter runtime's
+       * IRRuntimeNewGeometryTessellationEmulationPipeline builds it. */
+      id<MTLLibrary> Lh = (id<MTLLibrary>)g->hull_library, Ld = (id<MTLLibrary>)g->domain_library;
+      id<MTLFunction> th = nil, tt = nil, td = nil, tm = nil;
+      MTLFunctionConstantValues *vc = [[[MTLFunctionConstantValues alloc] init] autorelease];
+      MTLFunctionConstantValues *hc = [[[MTLFunctionConstantValues alloc] init] autorelease];
+      BOOL on = YES;
+      float mtf = g->max_tessellation_factor;
+      if (!Lh || !Ld) {
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: missing library (hull %d domain %d)\n", !!Lh, !!Ld);
+        return STATUS_SUCCESS;
+      }
+      fsi = [[Ls newFunctionWithName:Ls.functionNames.firstObject] autorelease];
+      [vc setConstantValue:&on type:MTLDataTypeBool withName:@"tessellationEnabled"];
+      e = nil;
+      fo = [[Lv newFunctionWithName:[NSString stringWithFormat:@"%s.dxil_irconverter_object_shader", g->vertex_function]
+                     constantValues:vc error:&e] autorelease];
+      if (!fo)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: object function '%s.dxil_irconverter_object_shader': %s\n",
+                g->vertex_function, e ? [[e localizedDescription] UTF8String] : "?");
+      [hc setConstantValue:&vsz type:MTLDataTypeInt withName:@"vertex_shader_output_size_fc"];
+      [hc setConstantValue:&mtf type:MTLDataTypeFloat withName:@"max_tessellation_factor_fc"];
+      e = nil;
+      th = [[Lh newFunctionWithName:@"irconverter_hull_shader" constantValues:hc error:&e] autorelease];
+      if (!th)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: hull function: %s\n", e ? [[e localizedDescription] UTF8String] : "?");
+      e = nil;
+      tt = [[Lh newFunctionWithName:@"irconverter_tessellator" constantValues:hc error:&e] autorelease];
+      if (!tt)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: tessellator function: %s\n", e ? [[e localizedDescription] UTF8String] : "?");
+      td = [[Ld newFunctionWithName:@"irconverter_dxil_domain_shader"] autorelease];
+      tm = [[Ld newFunctionWithName:[NSString stringWithUTF8String:g->geometry_function]] autorelease];
+      if (g->fragment_function[0])
+        ff = [[Lf newFunctionWithName:[NSString stringWithUTF8String:g->fragment_function]] autorelease];
+      if (!fsi || !fo || !th || !tt || !td || !tm || (g->fragment_function[0] && !ff)) {
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline REFUSED: stage-in %d object %d hull %d tessellator %d domain %d "
+                        "mesh '%s' %d fragment %d\n", !!fsi, !!fo, !!th, !!tt, !!td, g->geometry_function, !!tm, !!ff);
+        return STATUS_SUCCESS;
+      }
+      d.objectFunction = fo;
+      d.meshFunction = tm;
+      d.fragmentFunction = ff;
+      {
+        MTLLinkedFunctions *ol = [MTLLinkedFunctions linkedFunctions], *ml = [MTLLinkedFunctions linkedFunctions];
+        ol.functions = @[ fsi, th ];
+        ml.functions = @[ tt, td ];
+        d.objectLinkedFunctions = ol;
+        d.meshLinkedFunctions = ml;
+      }
+      e = nil;
+      params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithMeshDescriptor:d
+                                                                                                      options:MTLPipelineOptionNone
+                                                                                                   reflection:nil
+                                                                                                        error:&e];
+      if (!params->ret_pso)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: %s\n", e ? [[e localizedDescription] UTF8String] : "?");
+      else {
+        static unsigned said;
+        if (said++ < 4)
+          fprintf(stderr, "[winemetal] DXIL tessellation pipeline OK: vs '%s' mesh '%s' ps '%s', vertex %u B, max factor %.1f\n",
+                  g->vertex_function, g->geometry_function, g->fragment_function, g->gs_vertex_size_bytes, (double)mtf);
+      }
+      return STATUS_SUCCESS;
+    }
 
     cv = [[[MTLFunctionConstantValues alloc] init] autorelease];
     fsi = [[Ls newFunctionWithName:Ls.functionNames.firstObject] autorelease];
